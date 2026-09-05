@@ -141,6 +141,8 @@ export interface DiscoveredModel {
 	contextWindow?: number;
 	maxTokens?: number;
 	reasoning?: boolean;
+	thinkingMode?: "auto" | "enabled" | "disabled";
+	thinkingEffort?: "low" | "medium" | "high";
 	hasImageInput?: boolean;
 }
 
@@ -199,13 +201,27 @@ export async function fetchModelList(baseUrl: string, apiKey: string | undefined
 
 		const reasoning = explicitReasoning ?? inferReasoningSupport(record.id);
 
+		const thinkingMode =
+			typeof record.thinking_mode === "string" && ["auto", "enabled", "disabled"].includes(record.thinking_mode)
+				? (record.thinking_mode as "auto" | "enabled" | "disabled")
+				: typeof record.thinkingMode === "string" && ["auto", "enabled", "disabled"].includes(record.thinkingMode)
+					? (record.thinkingMode as "auto" | "enabled" | "disabled")
+					: undefined;
+
+		const thinkingEffort =
+			typeof record.thinking_effort === "string" && ["low", "medium", "high"].includes(record.thinking_effort)
+				? (record.thinking_effort as "low" | "medium" | "high")
+				: typeof record.thinkingEffort === "string" && ["low", "medium", "high"].includes(record.thinkingEffort)
+					? (record.thinkingEffort as "low" | "medium" | "high")
+					: undefined;
+
 		const hasImageInput = Array.isArray(record.input)
 			? (record.input as unknown[]).includes("image")
 			: Array.isArray(record.supported_input_modalities)
 				? (record.supported_input_modalities as unknown[]).includes("image")
 				: false;
 
-		output.push({ id: record.id, types, contextWindow, maxTokens, reasoning, hasImageInput });
+		output.push({ id: record.id, types, contextWindow, maxTokens, reasoning, thinkingMode, thinkingEffort, hasImageInput });
 	}
 
 	return output;
