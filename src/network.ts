@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import type { RelayApi, RelayProviderEntry, CompiledOverride } from "./types.ts";
+import { inferReasoningSupport } from "./reasoning.ts";
 import {
 	DISCOVERY_TIMEOUT_MS,
 	MAX_RETRIES,
@@ -189,12 +190,14 @@ export async function fetchModelList(baseUrl: string, apiKey: string | undefined
 					? record.maxTokens
 					: undefined;
 
-		const reasoning =
+		const explicitReasoning =
 			typeof record.reasoning === "boolean"
 				? record.reasoning
 				: typeof record.supports_reasoning === "boolean"
 					? record.supports_reasoning
 					: undefined;
+
+		const reasoning = explicitReasoning ?? inferReasoningSupport(record.id);
 
 		const hasImageInput = Array.isArray(record.input)
 			? (record.input as unknown[]).includes("image")

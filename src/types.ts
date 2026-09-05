@@ -24,6 +24,8 @@ export interface RelayModelMeta {
 	contextWindow?: number;
 	maxTokens?: number;
 	reasoning?: boolean;
+	thinkingLevelMap?: Record<string, string | null>;
+	compat?: Record<string, unknown>;
 	input?: ("text" | "image")[];
 	health?: HealthStatus;
 	metrics?: PerformanceMetrics;

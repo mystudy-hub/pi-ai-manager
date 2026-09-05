@@ -81,6 +81,7 @@ git clone https://github.com/mystudy-hub/pi-ai-manager.git ~/.pi/agent/extension
 | 快捷键 | 功能描述 |
 | :--- | :--- |
 | `Space` | 勾选 / 取消勾选当前模型（启用后即可在 Pi 中直接使用） |
+| `g` / `b` | 切换当前模型的思考/推理能力（Thinking / Reasoning 🧠） |
 | `t` | 测试当前选中的模型连通性与响应延时 |
 | `T` | 测试当前网关的所有已启用模型 |
 | `A` | 测试所有发现的模型 |
@@ -112,6 +113,7 @@ pi-ai-manager/
 │   ├── config.ts             # 配置加载、原子写入与防抖落盘
 │   ├── config-v2.ts          # 配置备份容灾与恢复机制
 │   ├── provider.ts           # 动态向 Pi 注册适配的 Model Provider
+│   ├── reasoning.ts          # 模型思考/推理能力推断与 Thinking 参数适配
 │   ├── api-detect.ts         # 自动协议嗅探
 │   ├── network.ts            # 模型列表请求与网络适配
 │   ├── testing.ts            # 模型可用性探针与测速

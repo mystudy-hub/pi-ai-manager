@@ -25,6 +25,7 @@ import { registerProviderFor, applyDiscovery } from "./provider.ts";
 import { testModelsInParallel, testModel as testModelFn, pickQuestions, applyTestResultToMeta } from "./testing.ts";
 import { normalizeModelName, findDuplicateModels, compareInstances } from "./dedup.ts";
 import { detectDefaultApi } from "./api-detect.ts";
+import { inferReasoningSupport, inferThinkingLevelMap, inferModelCompat } from "./reasoning.ts";
 import { TextInput } from "./tui-input.ts";
 import { OperationHistory, type Operation } from "./tui-state.ts";
 
@@ -101,6 +102,7 @@ const HELP_TEXT: readonly string[] = [
 	"  Space           Toggle model enable/disable",
 	"  t / T           Test selected / all visible models",
 	"  p               Cycle model API (auto → anthropic → responses → completions)",
+	"  g / b           Toggle thinking/reasoning support for model",
 	"  c               Compare model across gateways",
 	"",
 	"Batch actions:",
@@ -389,6 +391,37 @@ export class RelayManagerTUI {
 		}
 	}
 
+	private toggleModelReasoning(): void {
+		const entry = this.config.providers[this.state.selectedGateway];
+		const row = this.state.filteredRows[this.state.selectedModelIndex];
+		if (!entry || !row || !entry.models[row.id]) return;
+		const meta = entry.models[row.id];
+
+		const current = meta.reasoning ?? inferReasoningSupport(row.id);
+		const next = !current;
+		meta.reasoning = next;
+		row.meta.reasoning = next;
+
+		if (next) {
+			const api = meta.api ?? entry.defaultApi;
+			meta.thinkingLevelMap ??= inferThinkingLevelMap(row.id);
+			meta.compat ??= inferModelCompat(row.id, api);
+		}
+
+		this.operationHistory.record({
+			description: `Toggle reasoning for ${row.id} (${next ? "enabled" : "disabled"})`,
+			undo: () => {
+				meta.reasoning = current;
+				row.meta.reasoning = current;
+			},
+		});
+
+		this.ctx.ui.notify(
+			`Reasoning ${next ? "enabled" : "disabled"} for ${row.id}`,
+			"info",
+		);
+	}
+
 	/** One framed full-width line: `│<content>│`. */
 	private fullRow(theme: any, content: string, w: number): string {
 		return theme.fg("accent", "│") + this.cell(content, w - 2) + theme.fg("accent", "│");
@@ -506,12 +539,14 @@ export class RelayManagerTUI {
 				const healthSymbol = theme.fg(health.color, health.symbol);
 				const status = `${healthSymbol} ${this.formatTestResult(row)} ${this.formatMetrics(row.meta.metrics)}`;
 				const badge = qualityBadge ? ` ${qualityBadge}` : "";
+				const isReasoning = row.meta.reasoning ?? inferReasoningSupport(row.id);
+				const thinkBadge = isReasoning ? ` ${theme.fg("warning", "🧠")}` : "";
 
 				const pinned = apiRules.find((r) => r.regex.test(row.id))?.api;
 				const effectiveApi = pinned ?? row.meta.api ?? entry?.defaultApi ?? "openai-responses";
 				const apiTag = theme.fg(pinned ? "accent" : "dim", API_TAGS[effectiveApi]);
 
-				right = ` ${marker} ${checkbox} ${row.id}${badge} ${apiTag}  ${status}`;
+				right = ` ${marker} ${checkbox} ${row.id}${badge}${thinkBadge} ${apiTag}  ${status}`;
 			}
 
 			lines.push(this.row(theme, left, right, leftWidth, rightWidth));
@@ -557,7 +592,7 @@ export class RelayManagerTUI {
 		const helpLines = this.state.isFiltering
 			? ["Type to filter... (Enter: apply, Esc: cancel)"]
 			: [
-					`Space: toggle | t: test | T: test all | p: api | a: auto | d: dedup | e/x: pattern${undoHint} | ?: help`,
+					`Space: toggle | g: think | t: test | T: test all | p: api | a: auto | d: dedup | e/x: pattern${undoHint} | ?: help`,
 					"n: add provider | D/dd: delete | ↑↓←→: nav | /: filter | s: sort | q: quality | r/R/A | Enter/Esc",
 				];
 		for (const help of helpLines) {
@@ -1355,6 +1390,12 @@ export class RelayManagerTUI {
 		// p: cycle the selected model's API (endpoint protocol)
 		if (data === "p" && this.state.activePane === "models") {
 			this.cycleModelApi();
+			return true;
+		}
+
+		// g / b: toggle thinking / reasoning
+		if ((data === "g" || data === "b") && this.state.activePane === "models") {
+			this.toggleModelReasoning();
 			return true;
 		}
 
