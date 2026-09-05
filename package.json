@@ -1,0 +1,53 @@
+{
+  "name": "pi-ai-manager",
+  "version": "3.1.3",
+  "description": "Interactive AI Gateway & Model Manager extension for Pi Coding Agent",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "ai-gateway",
+    "model-manager",
+    "llm",
+    "tui"
+  ],
+  "author": "mystudy-hub",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/**/*.ts",
+    "docs/**/*",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mystudy-hub/pi-ai-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mystudy-hub/pi-ai-manager/issues"
+  },
+  "homepage": "https://github.com/mystudy-hub/pi-ai-manager#readme",
+  "scripts": {
+    "test": "node tests/test-config-write.js && node tests/verify-integration.js",
+    "typecheck": "tsc --noEmit"
+  }
+}
