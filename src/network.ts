@@ -70,15 +70,57 @@ export function sleep(ms: number): Promise<void> {
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
 	const controller = new AbortController();
+	if (init.signal) {
+		if (init.signal.aborted) {
+			controller.abort();
+		} else {
+			init.signal.addEventListener("abort", () => controller.abort(), { once: true });
+		}
+	}
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	let timerCleared = false;
+	const clearTimer = () => {
+		if (!timerCleared) {
+			timerCleared = true;
+			clearTimeout(timer);
+		}
+	};
+
 	try {
-		return await fetch(url, { ...init, signal: controller.signal });
+		const response = await fetch(url, { ...init, signal: controller.signal });
+
+		const origJson = response.json.bind(response);
+		const origText = response.text.bind(response);
+
+		const wrapWithAbort = <T>(promise: Promise<T>): Promise<T> => {
+			if (controller.signal.aborted) {
+				clearTimer();
+				throw new RelayError("timeout", `request to ${url} timed out after ${timeoutMs / 1000}s`);
+			}
+			const abortPromise = new Promise<never>((_, reject) => {
+				controller.signal.addEventListener(
+					"abort",
+					() => {
+						clearTimer();
+						reject(new RelayError("timeout", `request to ${url} timed out after ${timeoutMs / 1000}s`));
+					},
+					{ once: true },
+				);
+			});
+			return Promise.race([promise, abortPromise]).finally(() => {
+				clearTimer();
+			});
+		};
+
+		response.json = () => wrapWithAbort(origJson());
+		response.text = () => wrapWithAbort(origText());
+
+		return response;
 	} catch (error) {
+		clearTimer();
 		if (controller.signal.aborted)
 			throw new RelayError("timeout", `request to ${url} timed out after ${timeoutMs / 1000}s`);
 		throw new RelayError("network", `request to ${url} failed: ${error instanceof Error ? error.message : String(error)}`);
-	} finally {
-		clearTimeout(timer);
 	}
 }
 

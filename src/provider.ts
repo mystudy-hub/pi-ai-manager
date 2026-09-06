@@ -55,6 +55,8 @@ export function applyDiscovery(
 			reasoning,
 			...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 			...(compat ? { compat } : {}),
+			...(existing?.thinkingMode !== undefined ? {} : model.thinkingMode !== undefined ? { thinkingMode: model.thinkingMode } : {}),
+			...(existing?.thinkingEffort !== undefined ? {} : model.thinkingEffort !== undefined ? { thinkingEffort: model.thinkingEffort } : {}),
 			...(existing?.input !== undefined ? {} : model.hasImageInput ? { input: ["text", "image"] as ("text" | "image")[] } : {}),
 		};
 	}
@@ -80,6 +82,8 @@ export function buildModelConfigs(entry: RelayProviderEntry, ids: readonly strin
 			reasoning,
 			...(thinkingLevelMap ? { thinkingLevelMap: thinkingLevelMap as any } : {}),
 			...(compat ? { compat: compat as any } : {}),
+			...(meta.thinkingMode ? { thinkingMode: meta.thinkingMode } : {}),
+			...(meta.thinkingEffort ? { thinkingEffort: meta.thinkingEffort } : {}),
 			input: meta.input ?? ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: meta.contextWindow ?? DEFAULT_CONTEXT_WINDOW,

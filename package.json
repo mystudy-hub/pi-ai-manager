@@ -47,7 +47,7 @@
   },
   "homepage": "https://github.com/mystudy-hub/pi-ai-manager#readme",
   "scripts": {
-    "test": "node tests/test-config-write.js && node tests/test-reasoning.js && node tests/verify-integration.js",
+    "test": "node tests/test-config-write.js && node tests/test-reasoning.js && node tests/verify-integration.js && node tests/review-regression.cjs",
     "typecheck": "tsc --noEmit"
   }
 }

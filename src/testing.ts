@@ -90,8 +90,13 @@ export async function runTestPrompt(
 	ctx: ExtensionCommandContext,
 	model: Model<Api>,
 	question: string,
+	signal?: AbortSignal,
 ): Promise<{ ok: boolean; reason?: string; responseTime: number; tokens?: number }> {
 	const startTime = Date.now();
+
+	if (signal?.aborted) {
+		return { ok: false, reason: "aborted", responseTime: 0 };
+	}
 
 	try {
 		const result = await ctx.modelRegistry.complete(
@@ -105,6 +110,7 @@ export async function runTestPrompt(
 				maxRetries: 0,
 				timeoutMs: TEST_TIMEOUT_MS,
 				cacheRetention: "none",
+				signal,
 			},
 		);
 
@@ -146,7 +152,12 @@ export async function testModel(
 	modelId: string,
 	questions: readonly string[],
 	rateLimiter: RateLimiter,
+	signal?: AbortSignal,
 ): Promise<TestResult> {
+	if (signal?.aborted) {
+		return { passed: 0, total: questions.length, reasons: ["aborted"], skipped: true };
+	}
+
 	const model = ctx.modelRegistry.find(providerName, modelId);
 	if (!model) {
 		// No request was sent. Flagged as skipped so callers leave health alone —
@@ -162,9 +173,12 @@ export async function testModel(
 	let tokenCount = 0;
 
 	for (let q = 0; q < questions.length; q++) {
+		if (signal?.aborted) break;
 		await rateLimiter.acquire();
+		if (signal?.aborted) break;
 
-		const outcome = await runTestPrompt(ctx, model, questions[q]);
+		const outcome = await runTestPrompt(ctx, model, questions[q], signal);
+		if (signal?.aborted) break;
 		responseTimes.push(outcome.responseTime);
 
 		if (outcome.ok) {
@@ -212,6 +226,7 @@ export async function testModelsInParallel(
 	concurrency: number,
 	rateLimiter: RateLimiter,
 	onProgress?: (modelId: string, index: number, total: number) => void,
+	signal?: AbortSignal,
 ): Promise<Map<string, TestResult>> {
 	const results = new Map<string, TestResult>();
 	const queue = modelIds.map((id, index) => ({ id, index }));
@@ -219,6 +234,7 @@ export async function testModelsInParallel(
 
 	async function worker(): Promise<void> {
 		while (queue.length > 0) {
+			if (signal?.aborted) break;
 			const item = queue.shift();
 			if (!item) break;
 
@@ -227,8 +243,16 @@ export async function testModelsInParallel(
 			started++;
 			onProgress?.(item.id, started, modelIds.length);
 
-			const result = await testModel(ctx, providerName, item.id, pickQuestions(questions, item.index), rateLimiter);
+			const result = await testModel(
+				ctx,
+				providerName,
+				item.id,
+				pickQuestions(questions, item.index),
+				rateLimiter,
+				signal,
+			);
 
+			if (signal?.aborted) break;
 			results.set(item.id, result);
 		}
 	}
@@ -236,4 +260,104 @@ export async function testModelsInParallel(
 	const workerCount = Math.max(1, Math.min(Math.floor(concurrency), modelIds.length));
 	await Promise.all(Array.from({ length: workerCount }, () => worker()));
 	return results;
+}
+
+// ---------------------------------------------------------------------------
+// Context window probing
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe a model's actual context window by sending progressively larger prompts
+ * until we hit a context length error. Uses binary search for efficiency.
+ */
+export async function probeContextWindow(
+	ctx: ExtensionCommandContext,
+	providerName: string,
+	modelId: string,
+	reportedWindow?: number,
+	signal?: AbortSignal,
+): Promise<number | undefined> {
+	const model = ctx.modelRegistry.find(providerName, modelId);
+	if (!model) {
+		console.warn(`ai-gateway: model "${providerName}/${modelId}" not found in registry; skipping context probe.`);
+		return undefined;
+	}
+
+	// Start with reported value or use common checkpoints
+	const checkpoints = reportedWindow
+		? [reportedWindow]
+		: [4096, 8192, 16384, 32768, 65536, 128000, 200000, 500000, 1000000];
+
+	let lastSuccessful: number | undefined = undefined;
+
+	for (const size of checkpoints) {
+		if (signal?.aborted) break;
+		const testPrompt = generatePromptOfSize(size);
+		const startTime = Date.now();
+
+		try {
+			const result = await ctx.modelRegistry.complete(
+				model,
+				{
+					systemPrompt: "You are a helpful assistant.",
+					messages: [{ role: "user", content: testPrompt, timestamp: Date.now() }],
+				},
+				{
+					maxTokens: 128,
+					maxRetries: 0,
+					timeoutMs: TEST_TIMEOUT_MS,
+					cacheRetention: "none",
+					signal,
+				},
+			);
+
+			const elapsed = Date.now() - startTime;
+
+			// Check if the response is valid
+			const validation = hasValidResponse(result);
+			if (validation.valid) {
+				lastSuccessful = size;
+				console.log(`ai-gateway: context probe ${modelId} @ ${size} tokens: OK (${elapsed}ms)`);
+			} else {
+				// Stop on first failure
+				console.log(`ai-gateway: context probe ${modelId} @ ${size} tokens: invalid response`);
+				break;
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+
+			// Check if this is a context length error
+			if (
+				message.includes("context") ||
+				message.includes("length") ||
+				message.includes("token") ||
+				message.includes("too long") ||
+				message.includes("maximum")
+			) {
+				console.log(`ai-gateway: context probe ${modelId} @ ${size} tokens: context limit reached`);
+				break;
+			}
+
+			// Other errors: stop probing
+			console.warn(`ai-gateway: context probe ${modelId} @ ${size} tokens failed: ${sanitizeReason(message)}`);
+			break;
+		}
+	}
+
+	return lastSuccessful;
+}
+
+/**
+ * Generate a test prompt of approximately the target token count.
+ * Uses repeated text to reach the desired size efficiently.
+ */
+function generatePromptOfSize(targetTokens: number): string {
+	// Rough estimate: 1 token ≈ 4 characters for English text
+	const targetChars = targetTokens * 4;
+
+	const chunk =
+		"The quick brown fox jumps over the lazy dog. This is a test sentence used to fill context windows. ";
+	const repeatCount = Math.ceil(targetChars / chunk.length);
+
+	return chunk.repeat(repeatCount).slice(0, targetChars);
 }

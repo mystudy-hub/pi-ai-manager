@@ -7,8 +7,6 @@ import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { HealthStatus, PerformanceMetrics, RelayApi, RelayConfig, RelayModelMeta, RelayProviderEntry, RelaySettings } from "./types.ts";
 import { CONFIG_FILENAME, SUPPORTED_APIS } from "./types.ts";
-import { ConfigWriter } from "./performance.ts";
-import { getConfigRecoveryInstance } from "./config-v2.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -103,9 +101,30 @@ export function normalizeConfig(raw: unknown): RelayConfig {
 				const input = Array.isArray(m.input)
 					? (m.input.filter((x): x is "text" | "image" => x === "text" || x === "image") as ("text" | "image")[])
 					: undefined;
+				const thinkingLevelMap =
+					m.thinkingLevelMap && typeof m.thinkingLevelMap === "object"
+						? (m.thinkingLevelMap as Record<string, string | null>)
+						: undefined;
+				const thinkingMode =
+					typeof m.thinkingMode === "string" && ["auto", "enabled", "disabled"].includes(m.thinkingMode)
+						? (m.thinkingMode as "auto" | "enabled" | "disabled")
+						: undefined;
+				const thinkingEffort =
+					typeof m.thinkingEffort === "string" && ["low", "medium", "high"].includes(m.thinkingEffort)
+						? (m.thinkingEffort as "low" | "medium" | "high")
+						: undefined;
+				const compat =
+					m.compat && typeof m.compat === "object"
+						? (m.compat as Record<string, unknown>)
+						: undefined;
+
 				models[id] = {
 					api: m.api,
 					...(typeof m.reasoning === "boolean" ? { reasoning: m.reasoning } : {}),
+					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+					...(thinkingMode ? { thinkingMode } : {}),
+					...(thinkingEffort ? { thinkingEffort } : {}),
+					...(compat ? { compat } : {}),
 					...(typeof m.contextWindow === "number" ? { contextWindow: m.contextWindow } : {}),
 					...(typeof m.maxTokens === "number" ? { maxTokens: m.maxTokens } : {}),
 					...(input && input.length > 0 ? { input } : {}),
@@ -162,6 +181,17 @@ export function readConfig(): RelayConfig {
 		return normalizeConfig(JSON.parse(readFileSync(path, "utf-8")) as unknown);
 	} catch (error) {
 		console.warn(`ai-gateway: could not read ${path}: ${error instanceof Error ? error.message : String(error)}`);
+		try {
+			const { getConfigRecoveryInstance } = require("./config-v2.ts");
+			const recovery = getConfigRecoveryInstance();
+			const backup = recovery.tryRecover(path);
+			if (backup) {
+				console.log(`ai-gateway: recovered config from backup: ${backup.path}`);
+				return normalizeConfig(JSON.parse(backup.content) as unknown);
+			}
+		} catch (recError) {
+			console.warn(`ai-gateway: auto-recovery failed: ${recError instanceof Error ? recError.message : String(recError)}`);
+		}
 		return emptyConfig();
 	}
 }
@@ -222,25 +252,32 @@ function atomicWriteJson(path: string, value: unknown, mode = 0o600): void {
 let debouncedWriter: any = null;
 let pendingConfig: RelayConfig | null = null;
 
-function getDebouncedWriter(): ConfigWriter {
+function getDebouncedWriter() {
 	if (!debouncedWriter) {
-		debouncedWriter = new ConfigWriter();
+		try {
+			const { ConfigWriter } = require("./performance.ts");
+			debouncedWriter = new ConfigWriter();
+		} catch {
+			// performance.ts not available, return false to indicate unavailable
+			return false;
+		}
 	}
 	return debouncedWriter;
 }
 
 export function writeConfig(config: RelayConfig): void {
-	// Backup config before writing
+	// Backup config before writing (if config-v2.ts is available)
 	try {
+		const { getConfigRecoveryInstance } = require("./config-v2.ts");
 		getConfigRecoveryInstance().backup(configPath());
 	} catch {
-		// backup failed or skipped
+		// config-v2.ts not available, skip backup
 	}
 
 	// Store pending config
 	pendingConfig = config;
 
-	// Use debounced writer
+	// Use debounced writer if available
 	const writer = getDebouncedWriter();
 	if (writer) {
 		writer.scheduleWrite(() => {
@@ -250,9 +287,29 @@ export function writeConfig(config: RelayConfig): void {
 			}
 		}, 500);
 	} else {
+		// Direct write if debouncing not available
 		atomicWriteJson(configPath(), config);
 		pendingConfig = null;
 	}
+}
+
+export function writeConfigSync(config: RelayConfig): void {
+	// Cancel any pending debounced write because we are writing immediately
+	const writer = getDebouncedWriter();
+	if (writer && typeof writer.cancel === "function") {
+		writer.cancel();
+	}
+	pendingConfig = null;
+
+	// Backup config before writing (if config-v2.ts is available)
+	try {
+		const { getConfigRecoveryInstance } = require("./config-v2.ts");
+		getConfigRecoveryInstance().backup(configPath());
+	} catch {
+		// config-v2.ts not available, skip backup
+	}
+
+	atomicWriteJson(configPath(), config);
 }
 
 // Force immediate write (useful before exit)

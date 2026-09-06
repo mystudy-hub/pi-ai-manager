@@ -27,6 +27,7 @@ export interface TUIState {
 	selectedGateway: string;
 	gatewayScrollOffset: number;
 	selectedModelIndex: number;
+	selectedIndex?: number;
 	scrollOffset: number;
 	modelRows: ModelRow[];
 	filteredRows: ModelRow[];
@@ -51,7 +52,9 @@ export type OperationType =
 	| "invert"
 	| "toggle-all"
 	| "delete-provider"
-	| "add-provider";
+	| "add-provider"
+	| "toggle-reasoning"
+	| "custom";
 
 export interface Operation {
 	type: OperationType;
@@ -62,12 +65,29 @@ export interface Operation {
 	previousState: string[];
 	/** Snapshot of enabledModels after the operation */
 	newState: string[];
+	undoAction?: () => void;
 }
 
 export class OperationHistory {
 	private history: Operation[] = [];
 	private maxSize = 50;
 	private position = -1;
+
+	constructor(maxSize = 50) {
+		this.maxSize = maxSize;
+	}
+
+	record(op: { description: string; undo?: () => void; gateway?: string }): void {
+		this.push({
+			type: "custom",
+			timestamp: Date.now(),
+			gateway: op.gateway ?? "",
+			description: op.description,
+			previousState: [],
+			newState: [],
+			undoAction: op.undo,
+		});
+	}
 
 	push(op: Operation): void {
 		// Remove any redo operations when pushing new operation

@@ -25,6 +25,8 @@ export interface RelayModelMeta {
 	maxTokens?: number;
 	reasoning?: boolean;
 	thinkingLevelMap?: Record<string, string | null>;
+	thinkingMode?: "auto" | "enabled" | "disabled";
+	thinkingEffort?: "low" | "medium" | "high";
 	compat?: Record<string, unknown>;
 	input?: ("text" | "image")[];
 	health?: HealthStatus;
@@ -155,3 +157,6 @@ export class RelayError extends Error {
 export type SortMode = "name" | "status" | "performance" | "enabled";
 export type FilterMode = "all" | "enabled" | "healthy" | "untested";
 export type QualityFilter = "all" | "recommended" | "strict";
+
+export type ProviderEntry = RelayProviderEntry;
+export type { DiscoveredModel } from "./network.ts";

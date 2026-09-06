@@ -1,16 +1,16 @@
 // TUI Renderer - Pure rendering logic for AI Gateway TUI
 // Separated from tui.ts for better maintainability
 
-import type { DiscoveredModel, RelayConfig, ProviderEntry } from "./types.ts";
-import type { TUIState } from "./tui-state.ts";
+import type { RelayConfig, ProviderEntry } from "./types.ts";
+import type { TUIState, ModelRow } from "./tui-state.ts";
 
 export interface RenderContext {
 	config: RelayConfig;
 	state: TUIState;
 	selectedGateway: string;
-	models: DiscoveredModel[];
-	filteredModels: DiscoveredModel[];
-	visibleModels: DiscoveredModel[];
+	models: ModelRow[];
+	filteredModels: ModelRow[];
+	visibleModels: ModelRow[];
 	scrollOffset: number;
 	visibleRows: number;
 	hasUndoableOperation: boolean;
@@ -98,7 +98,7 @@ function renderModelTable(ctx: RenderContext): string {
 	for (let i = 0; i < ctx.visibleModels.length; i++) {
 		const model = ctx.visibleModels[i];
 		const absoluteIndex = ctx.scrollOffset + i;
-		const isSelected = absoluteIndex === ctx.state.selectedIndex;
+		const isSelected = absoluteIndex === (ctx.state.selectedModelIndex ?? ctx.state.selectedIndex);
 
 		lines.push(renderModelRow(model, isSelected));
 	}
@@ -119,21 +119,23 @@ function renderModelTable(ctx: RenderContext): string {
  * Render table header
  */
 function renderTableHeader(): string {
-	return "  Status  Model ID                                Quality  API Type  Speed";
+	return "  Status  Model ID                          Context  Think  Quality  API Type  Speed";
 }
 
 /**
  * Render a single model row
  */
-function renderModelRow(model: DiscoveredModel, isSelected: boolean): string {
+function renderModelRow(model: ModelRow, isSelected: boolean): string {
 	const cursor = isSelected ? "→" : " ";
 	const status = model.enabled ? "[✓]" : "[ ]";
-	const modelId = truncate(model.id, 40);
-	const quality = formatQuality(model.quality);
-	const apiType = formatApiType(model.apiType);
-	const speed = formatSpeed(model.latencyMs);
+	const modelId = truncate(model.id, 32);
+	const context = formatContextWindow(model.meta.contextWindow);
+	const thinking = formatThinking(model.meta.thinkingMode, model.meta.thinkingEffort);
+	const quality = formatQuality(model.qualityScore?.tier);
+	const apiType = formatApiType(model.meta.api);
+	const speed = formatSpeed(model.meta.metrics?.avgResponseTime);
 
-	return `${cursor} ${status}  ${modelId}  ${quality}  ${apiType}  ${speed}`;
+	return `${cursor} ${status}  ${modelId}  ${context}  ${thinking}  ${quality}  ${apiType}  ${speed}`;
 }
 
 /**
@@ -144,6 +146,8 @@ function renderStatusBar(ctx: RenderContext): string {
 
 	// Basic shortcuts
 	parts.push("Space: toggle");
+	parts.push("t: test");
+	parts.push("c: probe context");
 	parts.push("a: auto-select");
 	parts.push("d: dedup");
 	parts.push("e/x: enable/disable pattern");
@@ -183,6 +187,7 @@ export function renderHelpMode(): string {
 	lines.push("  Space           Toggle model enabled/disabled");
 	lines.push("  t               Test selected model");
 	lines.push("  T               Test all enabled models");
+	lines.push("  c               Probe context window for selected model");
 	lines.push("  p               Change API type for selected model");
 	lines.push("");
 
@@ -315,6 +320,22 @@ function formatSpeed(latencyMs?: number): string {
 	if (!latencyMs) return "untested";
 	if (latencyMs < 1000) return `${latencyMs}ms`;
 	return `${(latencyMs / 1000).toFixed(1)}s`;
+}
+
+function formatContextWindow(contextWindow?: number): string {
+	if (!contextWindow) return "    -   ";
+	if (contextWindow >= 1_000_000) return `${(contextWindow / 1_000_000).toFixed(1)}M`.padEnd(8);
+	if (contextWindow >= 1_000) return `${(contextWindow / 1_000).toFixed(0)}k`.padEnd(8);
+	return `${contextWindow}`.padEnd(8);
+}
+
+function formatThinking(mode?: "auto" | "enabled" | "disabled", effort?: "low" | "medium" | "high"): string {
+	if (!mode && !effort) return "  -   ";
+
+	const modeChar = mode === "enabled" ? "+" : mode === "disabled" ? "-" : "~";
+	const effortChar = effort === "high" ? "H" : effort === "medium" ? "M" : effort === "low" ? "L" : "-";
+
+	return `${modeChar}${effortChar}`.padEnd(6);
 }
 
 /**

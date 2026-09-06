@@ -4,7 +4,6 @@
 
 import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import type { RelayConfig } from "./types.ts";
 import { ConfigRecovery, ErrorHandler, safeReadConfig, safeWriteConfig } from "./error-handler.ts";
 
@@ -15,17 +14,19 @@ import { ConfigRecovery, ErrorHandler, safeReadConfig, safeWriteConfig } from ".
 let configRecoveryInstance: ConfigRecovery | undefined;
 let errorHandlerInstance: ErrorHandler | undefined;
 
-function getSettingsDir(): string {
-	return process.env.PI_EXTENSION_SETTINGS_DIR || join(homedir(), ".pi", "agent", "extension-settings");
-}
-
 function getBackupDir(): string {
 	// Use the same directory as config but in a backups subdirectory
-	return join(getSettingsDir(), "backups");
+	const settingsDir =
+		process.env.PI_EXTENSION_SETTINGS_DIR ||
+		join(require("node:os").homedir(), ".pi", "agent", "extension-settings");
+	return join(settingsDir, "backups");
 }
 
 function getErrorLogPath(): string {
-	return join(getSettingsDir(), "ai-gateway-errors.log");
+	const settingsDir =
+		process.env.PI_EXTENSION_SETTINGS_DIR ||
+		join(require("node:os").homedir(), ".pi", "agent", "extension-settings");
+	return join(settingsDir, "ai-gateway-errors.log");
 }
 
 export function getConfigRecoveryInstance(): ConfigRecovery {
@@ -43,14 +44,18 @@ export function getErrorHandlerInstance(): ErrorHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Safe Read / Write Operations
+// Safe Config Operations
 // ---------------------------------------------------------------------------
 
 /**
  * Safely read config with automatic recovery from backups
  */
 export function readConfigSafe(): RelayConfig {
-	const configPath = join(getSettingsDir(), "provider-ai.json");
+	const configPath = join(
+		process.env.PI_EXTENSION_SETTINGS_DIR ||
+			join(require("node:os").homedir(), ".pi", "agent", "extension-settings"),
+		"provider-ai.json"
+	);
 
 	const recovery = getConfigRecoveryInstance();
 	const errorHandler = getErrorHandlerInstance();
@@ -83,7 +88,11 @@ export function readConfigSafe(): RelayConfig {
  * Safely write config with automatic backup
  */
 export function writeConfigSafe(config: RelayConfig): boolean {
-	const configPath = join(getSettingsDir(), "provider-ai.json");
+	const configPath = join(
+		process.env.PI_EXTENSION_SETTINGS_DIR ||
+			join(require("node:os").homedir(), ".pi", "agent", "extension-settings"),
+		"provider-ai.json"
+	);
 
 	const recovery = getConfigRecoveryInstance();
 	const errorHandler = getErrorHandlerInstance();
@@ -127,7 +136,11 @@ export function restoreFromBackup(timestamp: number): boolean {
 		return false;
 	}
 
-	const configPath = join(getSettingsDir(), "provider-ai.json");
+	const configPath = join(
+		process.env.PI_EXTENSION_SETTINGS_DIR ||
+			join(require("node:os").homedir(), ".pi", "agent", "extension-settings"),
+		"provider-ai.json"
+	);
 
 	const success = recovery.restore(backup, configPath);
 	if (success) {

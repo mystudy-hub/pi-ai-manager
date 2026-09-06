@@ -476,7 +476,7 @@ export function handleRedo(ctx: HandlerContext): HandlerResult {
  * Handle sort mode toggle
  */
 export function handleSortToggle(ctx: HandlerContext): HandlerResult {
-	const modes = ["name", "quality", "speed", "api-type"] as const;
+	const modes = ["name", "status", "performance", "enabled"] as const;
 	const currentIndex = modes.indexOf(ctx.state.sortMode as any);
 	const nextIndex = (currentIndex + 1) % modes.length;
 
@@ -493,11 +493,14 @@ export function handleSortToggle(ctx: HandlerContext): HandlerResult {
  * Handle quality filter toggle
  */
 export function handleQualityFilterToggle(ctx: HandlerContext): HandlerResult {
-	ctx.state.qualityFilter = !ctx.state.qualityFilter;
+	const modes = ["all", "recommended", "strict"] as const;
+	const currentIndex = modes.indexOf(ctx.state.qualityFilter as any);
+	const nextIndex = (currentIndex + 1) % modes.length;
+	ctx.state.qualityFilter = modes[nextIndex];
 
 	return {
 		shouldRedraw: true,
-		message: `Quality filter: ${ctx.state.qualityFilter ? "ON" : "OFF"}`,
+		message: `Quality filter: ${ctx.state.qualityFilter}`,
 		messageType: "info",
 	};
 }

@@ -2,7 +2,7 @@
 // Unified Error Handling and Recovery
 // ---------------------------------------------------------------------------
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, renameSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export type ErrorLevel = "fatal" | "recoverable" | "warning";
@@ -138,7 +138,12 @@ export class ConfigRecovery {
 				`provider-ai.backup.${timestamp}.json`
 			);
 
-			writeFileSync(backupPath, content, "utf-8");
+			writeFileSync(backupPath, content, { encoding: "utf-8", mode: 0o600 });
+			if (process.platform !== "win32") {
+				try {
+					require("node:fs").chmodSync(backupPath, 0o600);
+				} catch {}
+			}
 
 			// Clean old backups
 			this.cleanOldBackups();
@@ -159,7 +164,7 @@ export class ConfigRecovery {
 	 */
 	listBackups(): ConfigBackup[] {
 		try {
-			const files = readdirSync(this.backupDir);
+			const files = require("node:fs").readdirSync(this.backupDir);
 			const backups: ConfigBackup[] = [];
 
 			for (const file of files) {
@@ -192,7 +197,12 @@ export class ConfigRecovery {
 	 */
 	restore(backup: ConfigBackup, targetPath: string): boolean {
 		try {
-			writeFileSync(targetPath, backup.content, "utf-8");
+			writeFileSync(targetPath, backup.content, { encoding: "utf-8", mode: 0o600 });
+			if (process.platform !== "win32") {
+				try {
+					require("node:fs").chmodSync(targetPath, 0o600);
+				} catch {}
+			}
 			return true;
 		} catch (error) {
 			console.error("Failed to restore backup:", error);
@@ -231,7 +241,7 @@ export class ConfigRecovery {
 			const toDelete = backups.slice(this.maxBackups);
 			for (const backup of toDelete) {
 				try {
-					unlinkSync(backup.path);
+					require("node:fs").unlinkSync(backup.path);
 				} catch {
 					// Ignore deletion failures
 				}
@@ -328,7 +338,7 @@ export function safeWriteConfig(
 		const tmp = `${configPath}.tmp.${process.pid}.${Date.now()}`;
 
 		writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600 });
-		renameSync(tmp, configPath);
+		require("node:fs").renameSync(tmp, configPath);
 
 		return { success: true };
 	} catch (error) {

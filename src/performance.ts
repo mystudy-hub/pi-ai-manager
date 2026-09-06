@@ -11,7 +11,7 @@ interface CacheEntry<V> {
 	expiry: number;
 }
 
-export class TTLCache<K, V> {
+export class TTLCache<K = string, V = any> {
 	private cache = new Map<K, CacheEntry<V>>();
 	private defaultTTL: number;
 
@@ -73,10 +73,23 @@ export class TTLCache<K, V> {
 // ---------------------------------------------------------------------------
 
 export class ConfigWriter {
-	private pendingWrite: NodeJS.Timeout | null = null;
+	private pendingWrite: any = null;
 	private pendingFn: (() => void) | null = null;
+	private defaultDelayMs: number;
+	private defaultWriteFn?: (data: any) => void;
 
-	scheduleWrite(fn: () => void, delayMs = 500): void {
+	constructor(delayMs = 500, writeFn?: (data: any) => void) {
+		this.defaultDelayMs = delayMs;
+		this.defaultWriteFn = writeFn;
+	}
+
+	write(data: any): void {
+		if (this.defaultWriteFn) {
+			this.scheduleWrite(() => this.defaultWriteFn!(data), this.defaultDelayMs);
+		}
+	}
+
+	scheduleWrite(fn: () => void, delayMs = this.defaultDelayMs): void {
 		// Cancel existing pending write
 		if (this.pendingWrite) {
 			clearTimeout(this.pendingWrite);
