@@ -5,7 +5,52 @@ const os = require('node:os');
 const { createRequire } = require('node:module');
 const { pathToFileURL } = require('node:url');
 
-const packageDir = 'C:/Users/maoju/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent';
+const PI_PACKAGE_NAME = '@earendil-works/pi-coding-agent';
+
+/** Walk up from `start` looking for the pi-coding-agent package manifest. */
+function findPackageDir(start) {
+  let dir = path.resolve(start);
+  for (let i = 0; i < 10; i++) {
+    try {
+      if (JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).name === PI_PACKAGE_NAME) return dir;
+    } catch { /* no manifest here, keep walking */ }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+/**
+ * Locate the installed pi package so we can borrow its `jiti` and `pi-tui`.
+ * Hardcoding one developer's global npm path made this suite unrunnable
+ * everywhere else, so resolve it the same way a user's shell would.
+ */
+function resolvePiPackageDir() {
+  const candidates = [];
+  if (process.env.PI_CODING_AGENT_PACKAGE_DIR) candidates.push(process.env.PI_CODING_AGENT_PACKAGE_DIR);
+
+  // The `pi` launcher on PATH: realpath it, then walk up to the package root.
+  for (const entry of (process.env.PATH || '').split(path.delimiter)) {
+    if (!entry) continue;
+    const bin = path.join(entry, process.platform === 'win32' ? 'pi.cmd' : 'pi');
+    if (!fs.existsSync(bin)) continue;
+    let resolved = bin;
+    try { resolved = fs.realpathSync(bin); } catch { /* use the launcher itself */ }
+    candidates.push(path.dirname(resolved));
+  }
+
+  for (const candidate of candidates) {
+    const found = findPackageDir(candidate);
+    if (found) return found;
+  }
+  throw new Error(
+    `Cannot locate the ${PI_PACKAGE_NAME} install. Run this test where \`pi\` is on PATH, ` +
+    'or set PI_CODING_AGENT_PACKAGE_DIR to its package directory.',
+  );
+}
+
+const packageDir = resolvePiPackageDir();
 const packageRequire = createRequire(path.join(packageDir, 'package.json'));
 const { createJiti } = packageRequire('jiti');
 const extensionDir = fs.existsSync(path.resolve(__dirname, '../src/tui.ts'))
@@ -282,11 +327,78 @@ async function main() {
     assert.equal(m.tui.state.mode, 'browse');
   });
 
+  // 13. [P0] x + pattern + Enter 禁用模型：曾因 else 分支引用 if 块内的 `matches`
+  //     抛 ReferenceError，经未 await 的 handleInput 变成 unhandled rejection 而终止 pi。
+  await testCase('13. Disable-by-pattern (x) removes matches and does not throw', async () => {
+    const m = manager();
+    await m.tui.handleInput('x');
+    assert.equal(m.tui.state.mode, 'pattern');
+    await m.tui.handleInput('gpt-5.4');
+    await m.tui.handleInput('\r');
+
+    assert.equal(m.tui.state.mode, 'browse', 'pattern form must close after submit');
+    assert.deepEqual(m.config.providers.alpha.enabledModels, []);
+    const disabled = m.events.filter(e => e.event === 'notify' && /Disabled/.test(e.message));
+    assert.deepEqual(disabled.map(e => e.message), ['Disabled 1 model(s) matching "gpt-5.4"']);
+
+    await m.tui.handleInput('u');
+    assert.deepEqual(m.config.providers.alpha.enabledModels, ['gpt-5.4'], 'undo must restore the disabled model');
+  });
+
+  // 14. [P0 对称路径] e + pattern + Enter 启用模型，且不误报禁用计数
+  await testCase('14. Enable-by-pattern (e) adds matches', async () => {
+    const m = manager();
+    await m.tui.handleInput(' ');
+    assert.deepEqual(m.config.providers.alpha.enabledModels, []);
+
+    await m.tui.handleInput('e');
+    await m.tui.handleInput('gpt-*');
+    await m.tui.handleInput('\r');
+
+    assert.deepEqual(m.config.providers.alpha.enabledModels, ['gpt-5.4']);
+    const enabled = m.events.filter(e => e.event === 'notify' && /Enabled/.test(e.message));
+    assert.deepEqual(enabled.map(e => e.message), ['Enabled 1 model(s) matching "gpt-*"']);
+  });
+
+  // 15. [P1] 同时写两个文件的路径必须同步落盘 provider-ai.json：若仍用 debounce
+  //     的 writeConfig，submitForm 返回时磁盘上还没有新 provider，两文件会不一致。
+  await testCase('15. Adding a provider persists provider-ai.json before syncing scoped models', async () => {
+    global.fetch = async () => new Response(
+      JSON.stringify({ data: [{ id: 'gpt-5.4', supported_endpoint_types: ['openai'] }] }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+
+    const m = manager();
+    // Seed settings.json so the "foreign patterns are preserved" half of
+    // computeScopedPatterns is covered without leaning on another test's leftovers.
+    fs.writeFileSync(path.join(runDir, 'settings.json'), JSON.stringify({ enabledModels: ['alpha/gpt-5.4'] }));
+
+    await m.tui.handleInput('n');
+    await m.tui.handleInput('beta');
+    await m.tui.handleInput('\r');
+    await m.tui.handleInput('https://beta.invalid');
+    await m.tui.handleInput('\r');
+    await m.tui.handleInput('synthetic-review-key-beta');
+    await m.tui.handleInput('\r');
+    assert.equal(m.tui.form.fieldIndex, 3, 'form should have reached the API field');
+    await m.tui.submitForm();
+
+    // No flushConfig(): the file must already be durable on return.
+    const saved = diskConfig().providers;
+    assert.ok(saved.beta, 'new provider must be on disk without waiting for the debounce timer');
+    assert.equal(saved.beta.baseUrl, 'https://beta.invalid');
+    assert.deepEqual(saved.beta.enabledModels, ['gpt-5.4']);
+
+    const scoped = JSON.parse(fs.readFileSync(path.join(runDir, 'settings.json'), 'utf8')).enabledModels;
+    assert.ok(scoped.includes('beta/gpt-5.4'), 'scoped models must include the new provider');
+    assert.ok(scoped.includes('alpha/gpt-5.4'), 'scoped models must keep the existing provider');
+  });
+
   console.log("\n============================================================");
   const passedCount = results.filter(r => r.pass).length;
   console.log(`Summary: ${passedCount}/${results.length} tests passed.`);
   if (passedCount === results.length) {
-    console.log("🎉 All 12 review regression tests passed flawlessly!");
+    console.log(`🎉 All ${results.length} review regression tests passed flawlessly!`);
   } else {
     process.exitCode = 1;
   }

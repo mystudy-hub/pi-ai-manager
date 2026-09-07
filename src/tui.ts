@@ -4,7 +4,7 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { matchesGlob, padToWidth, validateName } from "./utils.ts";
+import { matchesGlob, padToWidth, parseContextWindow, validateName } from "./utils.ts";
 import type {
 	RelayConfig,
 	RelayProviderEntry,
@@ -42,7 +42,7 @@ interface ModelRow {
 	qualityScore?: ModelQualityScore;
 }
 
-type TuiMode = "browse" | "form" | "pattern" | "help";
+type TuiMode = "browse" | "form" | "context" | "pattern" | "help";
 
 interface TUIState {
 	mode: TuiMode;
@@ -70,6 +70,12 @@ interface AddProviderForm {
 	status: string;
 	statusKind: "info" | "warning" | "error";
 	discovered?: DiscoveredModel[];
+}
+
+interface ContextWindowForm {
+	modelId: string;
+	input: TextInput;
+	status: string;
 }
 
 const API_CHOICES: readonly RelayApi[] = [...SUPPORTED_APIS];
@@ -104,6 +110,7 @@ const HELP_TEXT: readonly string[] = [
 	"  p               Cycle model API (auto → anthropic → responses → completions)",
 	"  g / b           Toggle thinking/reasoning support for model",
 	"  c               Compare model across gateways",
+	"  C               Set model context window (tokens / k / m)",
 	"",
 	"Batch actions:",
 	"  a               Auto-select recommended models",
@@ -165,6 +172,7 @@ export class RelayManagerTUI {
 	private readonly filterInput = new TextInput();
 	private pattern: { kind: "enable" | "disable"; input: TextInput } | null = null;
 	private form: AddProviderForm | null = null;
+	private contextForm: ContextWindowForm | null = null;
 	/** Gateway pending deletion confirmation. */
 	private confirmDelete: string | null = null;
 	/** An async form action is in flight; all keys are swallowed. */
@@ -508,6 +516,12 @@ export class RelayManagerTUI {
 			return lines.map((line) => padToWidth(line, w));
 		}
 
+		if (this.state.mode === "context" && this.contextForm) {
+			lines.push(...this.renderContextForm(theme, w));
+			lines.push(theme.fg("accent", "└" + "─".repeat(w - 2) + "┘"));
+			return lines.map((line) => padToWidth(line, w));
+		}
+
 		// Column headers
 		lines.push(
 			this.row(
@@ -632,7 +646,7 @@ export class RelayManagerTUI {
 		const helpLines = this.state.isFiltering
 			? ["Type to filter... (Enter: apply, Esc: cancel)"]
 			: [
-					`Space: toggle | g: think | t: test | T: test all | p: api | a: auto | d: dedup | e/x: pattern${undoHint} | ?: help`,
+					`Space: toggle | g: think | C: context | t: test | T: test all | p: api | a: auto | d: dedup | e/x: pattern${undoHint} | ?: help`,
 					"n: add provider | D/dd: delete | ↑↓←→: nav | /: filter | s: sort | q: quality | r/R/A | Enter/Esc",
 				];
 		for (const help of helpLines) {
@@ -642,6 +656,23 @@ export class RelayManagerTUI {
 		lines.push(theme.fg("accent", "└" + "─".repeat(w - 2) + "┘"));
 
 		return lines.map((line) => padToWidth(line, w));
+	}
+
+	private renderContextForm(theme: any, w: number): string[] {
+		const f = this.contextForm;
+		if (!f) return [];
+		const current = this.config.providers[this.state.selectedGateway]?.models[f.modelId]?.contextWindow;
+		const currentText = current ? `${current} tokens` : "not configured (Pi default: 256000)";
+		const fieldWidth = w - 14;
+		const field = theme.fg("accent", "› ") + f.input.render(theme, fieldWidth - 2);
+		return [
+			this.fullRow(theme, ` ${theme.bold("Set context window")} ${theme.fg("dim", "(Esc cancels)")}`, w),
+			this.fullRow(theme, ` Model: ${f.modelId}`, w),
+			this.fullRow(theme, ` Current: ${theme.fg("dim", currentText)}`, w),
+			theme.fg("accent", "│") + this.cell(" New length", 12) + this.cell(field, fieldWidth) + theme.fg("accent", "│"),
+			this.fullRow(theme, ` ${f.status || "Enter tokens, or use 128k / 1m. Enter saves; blank clears the override."}`, w),
+			this.fullRow(theme, theme.fg("dim", " Examples: 128k, 256000, 1m | Enter: save | Esc: cancel"), w),
+		];
 	}
 
 	private renderForm(theme: any, w: number): string[] {
@@ -812,7 +843,7 @@ export class RelayManagerTUI {
 				if (this.state.selectedGateway === targetGateway) {
 					this.loadModels();
 				}
-				this.ctx.ui.notify(`Context window for "${modelId}": ${detectedWindow} tokens`, "success");
+				this.ctx.ui.notify(`Context window for "${modelId}": ${detectedWindow} tokens`, "info");
 			} else {
 				this.ctx.ui.notify(`Could not detect context window for "${modelId}"`, "warning");
 			}
@@ -1112,7 +1143,7 @@ export class RelayManagerTUI {
 			}
 
 			this.loadModels();
-			this.ctx.ui.notify(`Disabled ${matches.length} model(s) matching "${pattern}"`, "info");
+			this.ctx.ui.notify(`Disabled ${matchSet.size} model(s) matching "${pattern}"`, "info");
 		}
 	}
 
@@ -1371,7 +1402,9 @@ export class RelayManagerTUI {
 		this.state.selectedModelIndex = 0;
 		this.state.scrollOffset = 0;
 		this.state.gatewayScrollOffset = 0;
-		writeConfig(this.config);
+		// Synchronous: syncScopedModels below writes settings.json immediately, so
+		// a debounced provider-ai.json write could leave the two files disagreeing.
+		writeConfigSync(this.config);
 		registerProviderFor(this.pi, name, entry);
 		syncScopedModels(name, entry);
 		this.loadModels();
@@ -1388,14 +1421,17 @@ export class RelayManagerTUI {
 		const entry = this.config.providers[name];
 		if (!entry) return;
 
-		// Clear scoped models before deleting the entry: afterwards the enabled
-		// list is gone and computeScopedPatterns could not clean up patterns.
-		syncScopedModels(name, { ...entry, enabledModels: [] });
+		const clearedScope = { ...entry, enabledModels: [] };
 		this.pi.unregisterProvider(name);
 		delete this.config.providers[name];
 		this.initialEnabled.delete(name);
 		this.initialProvidersState.delete(name);
-		writeConfig(this.config);
+		// provider-ai.json first, then settings.json. A crash between the two must
+		// leave the deleted gateway out of both files, never stranded in one. The
+		// entry is captured above because computeScopedPatterns cannot clean up
+		// patterns once the enabled list is gone from the config.
+		writeConfigSync(this.config);
+		syncScopedModels(name, clearedScope);
 
 		const gateways = Object.keys(this.config.providers);
 		this.state.selectedGateway = this.state.selectedGateway === name ? (gateways[0] ?? "") : this.state.selectedGateway;
@@ -1440,6 +1476,7 @@ export class RelayManagerTUI {
 		}
 
 		if (this.state.mode === "form" && this.form) return this.handleFormInput(data);
+		if (this.state.mode === "context" && this.contextForm) return this.handleContextInput(data);
 		if (this.state.mode === "pattern" && this.pattern) return this.handlePatternInput(data);
 		if (this.confirmDelete) return this.handleConfirmInput(data);
 
@@ -1602,6 +1639,12 @@ export class RelayManagerTUI {
 			return true;
 		}
 
+		// C: manually configure the selected model's context window
+		if (data === "C" && this.state.activePane === "models") {
+			this.openContextWindowForm();
+			return true;
+		}
+
 		// c: compare model across gateways
 		if (data === "c" && this.state.activePane === "models") {
 			await this.compareModel();
@@ -1724,6 +1767,59 @@ export class RelayManagerTUI {
 		return true;
 	}
 
+	private openContextWindowForm(): void {
+		const row = this.state.filteredRows[this.state.selectedModelIndex];
+		if (!row) return;
+		const current = row.meta.contextWindow;
+		this.contextForm = {
+			modelId: row.id,
+			input: new TextInput(),
+			status: current ? `Current value: ${current} tokens` : "",
+		};
+		this.state.mode = "context";
+	}
+
+	private handleContextInput(data: string): boolean {
+		const f = this.contextForm;
+		if (!f) return true;
+		const action = f.input.handleInput(data);
+		if (action === "cancel") {
+			this.contextForm = null;
+			this.state.mode = "browse";
+			return true;
+		}
+		if (action !== "submit") return true;
+
+		const entry = this.config.providers[this.state.selectedGateway];
+		const meta = entry?.models[f.modelId];
+		if (!entry || !meta) {
+			this.contextForm = null;
+			this.state.mode = "browse";
+			return true;
+		}
+		const raw = f.input.value.trim();
+		if (!raw) {
+			meta.contextWindow = undefined;
+		} else {
+			const parsed = parseContextWindow(raw);
+			if (!parsed) {
+				f.status = "Invalid value. Use a positive number, e.g. 128k, 256000, or 1m.";
+				return true;
+			}
+			meta.contextWindow = parsed;
+		}
+		writeConfig(this.config);
+		registerProviderFor(this.pi, this.state.selectedGateway, entry);
+		this.loadModels();
+		this.contextForm = null;
+		this.state.mode = "browse";
+		this.ctx.ui.notify(
+			meta.contextWindow ? `Context window for "${f.modelId}" set to ${meta.contextWindow} tokens` : `Context window override cleared for "${f.modelId}"`,
+			"info",
+		);
+		return true;
+	}
+
 	private handlePatternInput(data: string): boolean {
 		const p = this.pattern;
 		if (!p) return true;
@@ -1805,21 +1901,29 @@ export class RelayManagerTUI {
 			return false;
 		}
 
-		const result = await this.ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
-			return {
-				render: (width: number) => this.render(width, terminalHeight(), theme),
-				invalidate: () => {},
-				handleInput: async (data: string) => {
-					const shouldContinue = await this.handleInput(data);
-					if (!shouldContinue) {
-						// Report what actually happened; Esc must not claim a save.
-						done(this.saved);
-					} else {
-						tui.requestRender();
-					}
-				},
-			};
-		});
+		let result: boolean | undefined;
+		try {
+			result = await this.ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
+				return {
+					render: (width: number) => this.render(width, terminalHeight(), theme),
+					invalidate: () => {},
+					handleInput: async (data: string) => {
+						const shouldContinue = await this.handleInput(data);
+						if (!shouldContinue) {
+							// Report what actually happened; Esc must not claim a save.
+							done(this.saved);
+						} else {
+							tui.requestRender();
+						}
+					},
+				};
+			});
+		} finally {
+			// Durability net: save()/cancel() already write synchronously, but any path
+			// that leaves without one (an early throw, a mode guard) must not drop a
+			// debounced writeConfig that is still sitting in the 500ms timer.
+			flushConfig();
+		}
 		return result ?? false;
 	}
 }

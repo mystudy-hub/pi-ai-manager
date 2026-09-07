@@ -15,6 +15,20 @@ export function padToWidth(text: string, width: number): string {
 	return truncated + " ".repeat(Math.max(0, safeWidth - visibleWidth(truncated)));
 }
 
+/**
+ * Parse a manually entered context window. Accepts raw token counts and
+ * readable suffixes such as 128k, 256K, 1m, and 1.5M.
+ */
+export function parseContextWindow(value: string): number | undefined {
+	const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*([km]?)$/i);
+	if (!match) return undefined;
+	const amount = Number(match[1]);
+	const multiplier = match[2].toLowerCase() === "m" ? 1_000_000 : match[2].toLowerCase() === "k" ? 1_000 : 1;
+	const tokens = amount * multiplier;
+	if (!Number.isSafeInteger(tokens) || tokens <= 0) return undefined;
+	return tokens;
+}
+
 export function matchesGlob(value: string, pattern: string): boolean {
 	const expression = pattern
 		.replace(/[.+^${}()|[\]\\]/g, "\\$&")

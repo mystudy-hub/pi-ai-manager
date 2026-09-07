@@ -9,12 +9,14 @@ import assert from "node:assert";
 const cwd = process.cwd();
 const reasoningPath = pathToFileURL(join(cwd, "src", "reasoning.ts")).href;
 const providerPath = pathToFileURL(join(cwd, "src", "provider.ts")).href;
+const utilsPath = pathToFileURL(join(cwd, "src", "utils.ts")).href;
 
 async function runTests() {
 	console.log("Running reasoning support tests...\n");
 
 	const { inferReasoningSupport, inferThinkingLevelMap, inferModelCompat } = await import(reasoningPath);
 	const { buildModelConfigs } = await import(providerPath);
+	const { parseContextWindow } = await import(utilsPath);
 
 	// Test 1: DeepSeek reasoning models
 	console.log("Test 1: DeepSeek reasoning models");
@@ -105,6 +107,15 @@ async function runTests() {
 	assert.ok(dsConfig?.compat, "DeepSeek should have compat");
 	assert.strictEqual(mmConfig?.reasoning, false, "Minimax should have reasoning=false");
 	console.log("  ✓ buildModelConfigs correctly populates reasoning metadata");
+
+	// Test 7: Manual context window parsing
+	console.log("Test 7: Manual context window parsing");
+	assert.strictEqual(parseContextWindow("128k"), 128000);
+	assert.strictEqual(parseContextWindow("256000"), 256000);
+	assert.strictEqual(parseContextWindow("1.5M"), 1500000);
+	assert.strictEqual(parseContextWindow("0"), undefined);
+	assert.strictEqual(parseContextWindow("not-a-size"), undefined);
+	console.log("  ✓ Context window values correctly parsed");
 
 	console.log("\n🎉 All reasoning tests passed successfully!");
 }
