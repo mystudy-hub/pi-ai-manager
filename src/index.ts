@@ -13,33 +13,39 @@
  * are usable without opening the manager.
  */
 
-// TLS workaround for relay gateways with broken post-quantum handshakes
-import tls from "node:tls";
-tls.DEFAULT_ECDH_CURVE = "X25519";
-
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readConfig } from "./config.ts";
 import { registerProviderFor } from "./provider.ts";
 import { registerCommands } from "./commands.ts";
+import { safeError } from "./security.ts";
 
 // ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
 export default function aiGateway(pi: ExtensionAPI): void {
-	const config = readConfig();
-
-	// Register all configured providers
-	for (const [name, entry] of Object.entries(config.providers)) {
-		registerProviderFor(pi, name, entry);
+	registerCommands(pi);
+	let config;
+	try { config = readConfig(); }
+	catch (error) {
+		console.error(`ai-gateway: ${safeError(error)}`);
+		return;
 	}
 
-	const names = Object.keys(config.providers);
-	if (names.length === 0) {
+	// One invalid gateway must not stop other gateways or remove the manager command.
+	const names: string[] = [];
+	for (const [name, entry] of Object.entries(config.providers)) {
+		try {
+			registerProviderFor(pi, name, entry);
+			names.push(name);
+		} catch (error) {
+			console.error(`ai-gateway: could not register ${name}: ${safeError(error, [entry.apiKey ?? "", entry.apiKeyEnv ? process.env[entry.apiKeyEnv] ?? "" : ""])}`);
+		}
+	}
+
+	if (Object.keys(config.providers).length === 0) {
 		console.log("ai-gateway v3: no gateways configured. Run /ai-manager to add one.");
 	} else {
 		console.log(`ai-gateway v3: loaded ${names.length} gateway(s): ${names.join(", ")}`);
 	}
-
-	registerCommands(pi);
 }

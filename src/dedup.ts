@@ -2,14 +2,13 @@
 // Duplicate model detection and comparison
 // ---------------------------------------------------------------------------
 
+import { HEALTH_TTL_MS } from "./types.ts";
 import type { RelayConfig, DuplicateModelGroup, DuplicateModelInstance, HealthStatus } from "./types.ts";
 
 export function normalizeModelName(modelId: string): string {
 	return modelId
 		.toLowerCase()
-		.replace(/^[^/]+\//, "")
-		.replace(/[-_.](latest|instruct|chat|preview|free)$/g, "")
-		.replace(/[^a-z0-9]+/g, "");
+		.replace(/^[^/]+\//, "");
 }
 
 export function findDuplicateModels(config: RelayConfig): DuplicateModelGroup[] {
@@ -36,7 +35,8 @@ const HEALTH_RANK: Record<HealthStatus["status"], number> = { healthy: 0, degrad
  * beat a healthy one purely by failing fast.
  */
 export function compareInstances(a: DuplicateModelInstance, b: DuplicateModelInstance): number {
-	const byHealth = HEALTH_RANK[a.health?.status ?? "unknown"] - HEALTH_RANK[b.health?.status ?? "unknown"];
+	const status = (item: DuplicateModelInstance): HealthStatus["status"] => item.health?.lastCheck && Date.now() - item.health.lastCheck <= HEALTH_TTL_MS ? item.health.status : "unknown";
+	const byHealth = HEALTH_RANK[status(a)] - HEALTH_RANK[status(b)];
 	if (byHealth !== 0) return byHealth;
 	return (a.metrics?.avgResponseTime ?? Number.POSITIVE_INFINITY) - (b.metrics?.avgResponseTime ?? Number.POSITIVE_INFINITY);
 }

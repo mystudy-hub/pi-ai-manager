@@ -95,7 +95,7 @@ async function runTests() {
 		enabledModels: ["deepseek-v4-flash", "minimax-m3"],
 		models: {
 			"deepseek-v4-flash": { api: "openai-responses" },
-			"minimax-m3": { api: "openai-responses" },
+			"minimax-m3": { api: "openai-responses", reasoning: false },
 		},
 	};
 	const configs = buildModelConfigs(mockEntry, mockEntry.enabledModels);

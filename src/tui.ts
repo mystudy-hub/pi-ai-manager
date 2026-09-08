@@ -3,46 +3,39 @@
 // ---------------------------------------------------------------------------
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { matchesGlob, padToWidth, parseContextWindow, validateName } from "./utils.ts";
+import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesGlob, parseContextWindow, validateName } from "./utils.ts";
 import type {
 	RelayConfig,
 	RelayProviderEntry,
 	RelayModelMeta,
 	TestResult,
-	PerformanceMetrics,
-	HealthStatus,
 	FilterMode,
 	QualityFilter,
 	SortMode,
 	RelayApi,
 } from "./types.ts";
-import { DEFAULT_TEST_CONCURRENCY, DEFAULT_TEST_REQUEST_DELAY_MS, DEFAULT_TEST_QUESTIONS, SUPPORTED_APIS } from "./types.ts";
-import { scoreModel, filterModels, type ModelQualityScore } from "./model-scoring.ts";
-import { writeConfig, syncScopedModels, canonicalBaseUrl, flushConfig, writeConfigSync } from "./config.ts";
-import { RateLimiter, fetchModelList, compileOverrides, type DiscoveredModel } from "./network.ts";
-import { registerProviderFor, applyDiscovery } from "./provider.ts";
+import { DEFAULT_TEST_CONCURRENCY, DEFAULT_TEST_REQUEST_DELAY_MS, DEFAULT_TEST_QUESTIONS, SUPPORTED_APIS, TEST_QUESTIONS_PER_MODEL, HEALTH_TTL_MS } from "./types.ts";
+import { scoreModel, filterModels } from "./model-scoring.ts";
+import { canonicalBaseUrl, cloneConfig, commitConfig, readCurrentConfig } from "./config.ts";
+import { isEnvName, safeDisplay, safeError } from "./security.ts";
+import { RateLimiter, compileOverrides, fetchModelList, type DiscoveredModel } from "./network.ts";
+import { registerProviderFor, applyDiscovery, modelLimits, modelReasoning, providerApiKey, hasProviderAuth } from "./provider.ts";
 import { testModelsInParallel, testModel as testModelFn, pickQuestions, applyTestResultToMeta } from "./testing.ts";
 import { normalizeModelName, findDuplicateModels, compareInstances } from "./dedup.ts";
 import { detectDefaultApi } from "./api-detect.ts";
-import { inferReasoningSupport, inferThinkingLevelMap, inferModelCompat } from "./reasoning.ts";
 import { TextInput } from "./tui-input.ts";
 import { OperationHistory, type Operation } from "./tui-state.ts";
+import { beside, cell, fitHints, focusOffset, screen, screenSize, wrapLines, type ViewTheme, type ScreenSize } from "./tui-layout.ts";
+import { effectiveHealth, modelDetails, modelHeader, modelLine, modelSettingsLines, recordTime, type ModelRow } from "./tui-models.ts";
+import { summarizeDraft, type DraftSummary } from "./tui-draft.ts";
+import { COMMANDS, MODEL_SETTING_COMMANDS, HELP_TEXT, FILTER_LABELS, QUALITY_LABELS, SORT_LABELS, browseFooter, commandForInput, commandHint, dialogFooter, type Command, type CommandId, type MenuItem } from "./tui-commands.ts";
 
 // ---------------------------------------------------------------------------
 // Local types for TUI state
 // ---------------------------------------------------------------------------
 
-interface ModelRow {
-	id: string;
-	enabled: boolean;
-	testing: boolean;
-	testResult?: TestResult;
-	meta: RelayModelMeta;
-	qualityScore?: ModelQualityScore;
-}
-
-type TuiMode = "browse" | "form" | "context" | "pattern" | "help";
+type TuiMode = "browse" | "form" | "context" | "pattern" | "help" | "details" | "changes" | "compare" | "menu";
 
 interface TUIState {
 	mode: TuiMode;
@@ -70,12 +63,27 @@ interface AddProviderForm {
 	status: string;
 	statusKind: "info" | "warning" | "error";
 	discovered?: DiscoveredModel[];
+	editingName?: string;
 }
 
 interface ContextWindowForm {
 	modelId: string;
 	input: TextInput;
 	status: string;
+	returnMode: "browse" | "details";
+}
+
+interface GatewayView {
+	modelId?: string;
+	index: number;
+	scroll: number;
+}
+
+interface MenuState {
+	kind: "actions" | "filters";
+	input: TextInput;
+	index: number;
+	offset: number;
 }
 
 const API_CHOICES: readonly RelayApi[] = [...SUPPORTED_APIS];
@@ -84,56 +92,10 @@ const DEFAULT_API_INDEX = API_CHOICES.indexOf("openai-completions");
 /** States the `p` key cycles through for the selected model. "auto" = no pin, follow discovery. */
 const API_CYCLE: readonly (RelayApi | "auto")[] = ["auto", "anthropic-messages", "openai-responses", "openai-completions"];
 
-/** Short per-row labels for the effective API. */
-const API_TAGS: Record<RelayApi, string> = {
-	"anthropic-messages": "anthropic",
-	"openai-completions": "completions",
-	"openai-responses": "responses",
-};
-
 /** Exact-match regex rule key for a model id, used as a modelApiOverrides entry. */
 function exactApiRule(modelId: string): string {
 	return `^${modelId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
 }
-
-/** Keys shown in the help mode; also the source of truth for the help bar. */
-const HELP_TEXT: readonly string[] = [
-	"AI Gateway Manager — Keyboard Shortcuts",
-	"",
-	"Navigation:",
-	"  ↑↓ / PgUp PgDn  Move selection (active pane)",
-	"  ←→ / Tab        Switch between gateways and models panes",
-	"",
-	"Model actions:",
-	"  Space           Toggle model enable/disable",
-	"  t / T           Test selected / all visible models",
-	"  p               Cycle model API (auto → anthropic → responses → completions)",
-	"  g / b           Toggle thinking/reasoning support for model",
-	"  c               Compare model across gateways",
-	"  C               Set model context window (tokens / k / m)",
-	"",
-	"Batch actions:",
-	"  a               Auto-select recommended models",
-	"  d               Dedup (disable slower duplicates)",
-	"  e / x           Enable / disable models by glob pattern",
-	"  u               Undo last operation",
-	"",
-	"Gateway actions:",
-	"  n               Add provider (name, URL, key; API auto-detected)",
-	"  D / dd          Delete selected provider (asks again)",
-	"  r / R           Refresh current / all gateways",
-	"  A               Test all gateways",
-	"",
-	"Filters & sort:",
-	"  /               Search/filter models",
-	"  q               Toggle quality filter (all/recommended/strict)",
-	"  s               Cycle sort mode (name/status/performance/enabled)",
-	"",
-	"Other:",
-	"  ?               Show this help",
-	"  Enter           Save and exit",
-	"  Esc             Cancel without saving",
-];
 
 // ---------------------------------------------------------------------------
 // RelayManagerTUI
@@ -156,26 +118,17 @@ export class RelayManagerTUI {
 	private visibleRows: number = 10;
 	/** Whether the session ended via Enter (saved) rather than Esc (cancelled). */
 	private saved = false;
-	/**
-	 * Model configuration state per gateway at launch. Esc restores these even after a
-	 * mid-session flush (see cancel()).
-	 */
-	private readonly initialProvidersState: Map<
-		string,
-		{
-			enabledModels: string[];
-			modelApiOverrides: Record<string, RelayApi>;
-			models: Record<string, RelayModelMeta>;
-		}
-	>;
-	private readonly initialEnabled: Map<string, readonly string[]>;
+	private baseline: RelayConfig;
+	private readonly temporaryProviders = new Set<string>();
+	private requestRender: () => void = () => {};
+	private pendingTest: { gateway?: string; ids?: string[]; allGateways: boolean; count: number } | null = null;
 	private readonly filterInput = new TextInput();
 	private pattern: { kind: "enable" | "disable"; input: TextInput } | null = null;
 	private form: AddProviderForm | null = null;
 	private contextForm: ContextWindowForm | null = null;
 	/** Gateway pending deletion confirmation. */
 	private confirmDelete: string | null = null;
-	/** An async form action is in flight; all keys are swallowed. */
+	/** An async form action is in flight; Escape still cancels it. */
 	private busy = false;
 	/** Tracks the last key for vim-style double-press (dd to delete). */
 	private lastKey = "";
@@ -183,11 +136,139 @@ export class RelayManagerTUI {
 	private operationHistory = new OperationHistory();
 	private activeAbortController: AbortController | null = null;
 	private isClosed = false;
+	private helpOffset = 0;
+	private panelOffset = 0;
+	private panelLength = 0;
+	private panelRows = 1;
+	private panelContent: string[] = [];
+	private formOffset = 0;
+	private menu: MenuState | null = null;
+	private menuRows = 1;
+	private loadedGateway = "";
+	private readonly gatewayViews = new Map<string, GatewayView>();
+	private draftCache: DraftSummary | null = null;
+	private readonly sessionResults = new Map<string, { result: TestResult; lastCheck?: number }>();
+	private readonly testingModels = new Set<string>();
+	private readonly sessionSecrets = new Set<string>();
+	private taskLabel = "";
+	private notice = "";
+	private searchBefore = "";
+	private searchSelection: GatewayView | undefined;
+	private nextHealthExpiry = Infinity;
+
+	private taskIsCurrent(controller: AbortController): boolean {
+		return !this.isClosed && this.activeAbortController === controller && !controller.signal.aborted;
+	}
+
+	private restoreTemporaryProviders(): void {
+		if (this.temporaryProviders.size === 0) return;
+		let current: RelayConfig;
+		try { current = readCurrentConfig(); }
+		catch (error) {
+			// Keep temporary models/keys out of the registry even if the file became unreadable.
+			current = this.baseline;
+			this.reportError(error);
+		}
+		for (const name of this.temporaryProviders) {
+			const entry = current.providers[name];
+			try {
+				if (entry) registerProviderFor(this.pi, name, entry);
+				else this.pi.unregisterProvider(name);
+			} catch (error) {
+				this.pi.unregisterProvider(name);
+				this.reportError(error);
+			}
+		}
+		this.temporaryProviders.clear();
+	}
+
+	private registerTemporary(name: string, entry: RelayProviderEntry, ids?: string[]): void {
+		this.temporaryProviders.add(name);
+		registerProviderFor(this.pi, name, entry, ids);
+	}
 
 	private abortActiveTasks(): void {
-		if (this.activeAbortController) {
-			this.activeAbortController.abort();
-			this.activeAbortController = null;
+		const controller = this.activeAbortController;
+		this.activeAbortController = null;
+		controller?.abort();
+		this.busy = false;
+		this.state.testingInProgress = false;
+		this.testingModels.clear();
+		this.taskLabel = "";
+		this.ctx.ui.setStatus("ai-manager", undefined);
+		for (const row of this.state.modelRows) row.testing = false;
+		try { this.restoreTemporaryProviders(); } catch (error) { this.reportError(error); }
+	}
+
+	private reportError(error: unknown): void {
+		this.notice = safeError(error, this.secretValues());
+		this.ctx.ui.notify(this.notice, "error");
+	}
+
+	private secretValues(): string[] {
+		return [...this.sessionSecrets, ...[this.config, this.baseline].flatMap(config => Object.values(config.providers)
+			.flatMap(entry => [entry.apiKey ?? "", entry.apiKeyEnv ? process.env[entry.apiKeyEnv] ?? "" : ""]))];
+	}
+
+	private stopTask(): void {
+		if (!this.activeAbortController) return;
+		const progress = this.state.testingInProgress ? `（已完成 ${this.state.testProgress.current}/${this.state.testProgress.total}）` : "";
+		this.abortActiveTasks();
+		this.notice = `任务已停止${progress}；草稿与已完成记录已保留。`;
+		this.applyFiltersAndSort();
+		this.requestRender();
+	}
+
+	private draftSummary(): DraftSummary {
+		return this.draftCache ??= summarizeDraft(this.baseline, this.config);
+	}
+
+	private testKey(gateway: string, modelId: string): string { return JSON.stringify([gateway, modelId]); }
+
+	private beginModelTest(gateway: string, modelId: string): void {
+		this.testingModels.add(this.testKey(gateway, modelId));
+		const row = this.state.selectedGateway === gateway ? this.state.modelRows.find(row => row.id === modelId) : undefined;
+		if (row) row.testing = true;
+		this.requestRender();
+	}
+
+	private recordTestResult(gateway: string, modelId: string, result: TestResult): void {
+		const meta = this.config.providers[gateway]?.models[modelId];
+		if (!meta) return;
+		const safeResult = { ...result, reasons: result.reasons.map(reason => safeError(reason, this.secretValues())) };
+		applyTestResultToMeta(meta, safeResult);
+		this.sessionResults.set(this.testKey(gateway, modelId), { result: safeResult, lastCheck: meta.health?.lastCheck });
+		this.testingModels.delete(this.testKey(gateway, modelId));
+		const row = this.state.selectedGateway === gateway ? this.state.modelRows.find(row => row.id === modelId) : undefined;
+		if (row) { row.testing = false; row.testResult = safeResult; row.meta = meta; }
+		this.draftCache = null;
+		this.applyFiltersAndSort();
+	}
+
+	private async runTask(operation: (controller: AbortController) => Promise<void>): Promise<void> {
+		if (this.isClosed) return;
+		this.abortActiveTasks();
+		this.notice = "";
+		const controller = new AbortController();
+		this.activeAbortController = controller;
+		try {
+			const task = operation(controller);
+			this.requestRender();
+			await task;
+		} catch (error) {
+			if (this.taskIsCurrent(controller)) this.reportError(error);
+		} finally {
+			if (this.activeAbortController === controller) {
+				this.activeAbortController = null;
+				this.busy = false;
+				this.state.testingInProgress = false;
+				this.testingModels.clear();
+				this.taskLabel = "";
+				for (const row of this.state.modelRows) row.testing = false;
+				try { this.restoreTemporaryProviders(); } catch (error) { this.reportError(error); }
+				this.ctx.ui.setStatus("ai-manager", undefined);
+				this.requestRender();
+			}
 		}
 	}
 
@@ -195,19 +276,7 @@ export class RelayManagerTUI {
 		this.ctx = ctx;
 		this.pi = pi;
 		this.config = config;
-		this.initialEnabled = new Map(
-			Object.entries(config.providers).map(([name, entry]) => [name, [...entry.enabledModels]] as const),
-		);
-		this.initialProvidersState = new Map(
-			Object.entries(config.providers).map(([name, entry]) => [
-				name,
-				{
-					enabledModels: [...entry.enabledModels],
-					modelApiOverrides: { ...(entry.modelApiOverrides ?? {}) },
-					models: JSON.parse(JSON.stringify(entry.models)),
-				},
-			]),
-		);
+		this.baseline = cloneConfig(config);
 
 		const gateways = Object.keys(config.providers);
 		const selectedGateway =
@@ -224,8 +293,8 @@ export class RelayManagerTUI {
 			filteredRows: [],
 			isFiltering: false,
 			filterMode: "all",
-			sortMode: "status",
-			qualityFilter: "recommended",
+			sortMode: "enabled",
+			qualityFilter: "all",
 			testingInProgress: false,
 			testProgress: { current: 0, total: 0 },
 		};
@@ -240,26 +309,52 @@ export class RelayManagerTUI {
 	// ---- data helpers ----
 
 	private loadModels(): void {
+		this.draftCache = null;
+		let selectedId: string | undefined = this.state.filteredRows[this.state.selectedModelIndex]?.id;
+		if (this.loadedGateway !== this.state.selectedGateway) {
+			this.rememberModelView();
+			const view = this.gatewayViews.get(this.state.selectedGateway);
+			this.state.selectedModelIndex = view?.index ?? 0;
+			this.state.scrollOffset = view?.scroll ?? 0;
+			selectedId = view?.modelId;
+			this.loadedGateway = this.state.selectedGateway;
+		}
 		const entry = this.config.providers[this.state.selectedGateway];
 		if (!entry) {
 			this.state.modelRows = [];
 			this.state.filteredRows = [];
+			this.state.selectedModelIndex = 0;
+			this.state.scrollOffset = 0;
 			return;
 		}
 
 		const enabledSet = new Set(entry.enabledModels);
-		this.state.modelRows = Object.entries(entry.models).map(([id, meta]) => ({
-			id,
-			enabled: enabledSet.has(id),
-			testing: false,
-			meta,
-			qualityScore: scoreModel(id),
-		}));
+		this.state.modelRows = Object.entries(entry.models).map(([id, meta]) => {
+			const key = this.testKey(this.state.selectedGateway, id);
+			const previous = this.sessionResults.get(key);
+			return {
+				id, enabled: enabledSet.has(id), testing: this.testingModels.has(key), meta, qualityScore: scoreModel(id),
+				testResult: previous?.lastCheck === meta.health?.lastCheck ? previous?.result : undefined,
+			};
+		});
 
-		this.applyFiltersAndSort();
+		this.applyFiltersAndSort(selectedId ?? "");
 	}
 
-	private applyFiltersAndSort(): void {
+	private rememberModelView(): void {
+		if (!this.loadedGateway) return;
+		this.gatewayViews.set(this.loadedGateway, {
+			modelId: this.state.filteredRows[this.state.selectedModelIndex]?.id ?? this.gatewayViews.get(this.loadedGateway)?.modelId,
+			index: this.state.selectedModelIndex, scroll: this.state.scrollOffset,
+		});
+	}
+
+	private applyFiltersAndSort(selectedId = this.state.filteredRows[this.state.selectedModelIndex]?.id): void {
+		const now = Date.now();
+		this.nextHealthExpiry = this.state.modelRows.reduce((expiry, row) => {
+			const next = row.meta.health?.lastCheck ? row.meta.health.lastCheck + HEALTH_TTL_MS + 1 : Infinity;
+			return next > now ? Math.min(expiry, next) : expiry;
+		}, Infinity);
 		let filtered = [...this.state.modelRows];
 
 		// Quality filter
@@ -281,10 +376,10 @@ export class RelayManagerTUI {
 				filtered = filtered.filter(row => row.enabled);
 				break;
 			case "healthy":
-				filtered = filtered.filter(row => row.meta.health?.status === "healthy");
+				filtered = filtered.filter(row => effectiveHealth(row.meta.health, now) === "healthy");
 				break;
 			case "untested":
-				filtered = filtered.filter(row => !row.meta.health || row.meta.health.status === "unknown");
+				filtered = filtered.filter(row => effectiveHealth(row.meta.health, now) === "unknown");
 				break;
 		}
 
@@ -295,16 +390,16 @@ export class RelayManagerTUI {
 					return a.id.localeCompare(b.id);
 				case "status": {
 					const statusOrder = { healthy: 0, degraded: 1, down: 2, unknown: 3 };
-					const aStatus = a.meta.health?.status ?? "unknown";
-					const bStatus = b.meta.health?.status ?? "unknown";
+					const aStatus = effectiveHealth(a.meta.health, now);
+					const bStatus = effectiveHealth(b.meta.health, now);
 					const statusCmp = statusOrder[aStatus] - statusOrder[bStatus];
 					if (statusCmp !== 0) return statusCmp;
 					return a.id.localeCompare(b.id);
 				}
 				case "performance": {
-					const aTime = a.meta.metrics?.avgResponseTime ?? Infinity;
-					const bTime = b.meta.metrics?.avgResponseTime ?? Infinity;
-					return aTime - bTime;
+					const aTime = ["healthy", "degraded"].includes(effectiveHealth(a.meta.health, now)) ? a.meta.metrics?.avgResponseTime ?? Infinity : Infinity;
+					const bTime = ["healthy", "degraded"].includes(effectiveHealth(b.meta.health, now)) ? b.meta.metrics?.avgResponseTime ?? Infinity : Infinity;
+					return (aTime === bTime ? 0 : aTime - bTime) || a.id.localeCompare(b.id);
 				}
 				case "enabled":
 					if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
@@ -316,10 +411,10 @@ export class RelayManagerTUI {
 
 		this.state.filteredRows = filtered;
 
-		// Clamp selection
-		if (this.state.selectedModelIndex >= filtered.length) {
-			this.state.selectedModelIndex = Math.max(0, filtered.length - 1);
-		}
+		const index = selectedId ? filtered.findIndex(row => row.id === selectedId) : -1;
+		this.state.selectedModelIndex = index >= 0 ? index : Math.max(0, Math.min(this.state.selectedModelIndex, filtered.length - 1));
+		this.clampScroll();
+		this.rememberModelView();
 	}
 
 	private clampScroll(): void {
@@ -346,377 +441,308 @@ export class RelayManagerTUI {
 		}
 	}
 
-	// ---- formatting helpers ----
 
-	private formatHealth(health?: HealthStatus): { symbol: string; color: string } {
-		if (!health || health.status === "unknown") return { symbol: "•", color: "dim" };
-		switch (health.status) {
-			case "healthy": return { symbol: "✓", color: "success" };
-			case "degraded": return { symbol: "⚠", color: "warning" };
-			case "down": return { symbol: "✗", color: "error" };
-		}
+	/** Undo edited fields while retaining metadata learned by later discovery. */
+	private recordModelEdit(gateway: string, modelId: string, description: string, fields: readonly (keyof RelayModelMeta)[], overrideKey?: string): void {
+		const meta = this.config.providers[gateway]?.models[modelId];
+		if (!meta) return;
+		const before = JSON.parse(JSON.stringify(meta)) as RelayModelMeta;
+		const previousOverrides = overrideKey ? { ...this.config.providers[gateway].modelApiOverrides } : undefined;
+		this.operationHistory.record({ gateway, description, undo: () => {
+			const entry = this.config.providers[gateway];
+			if (!entry?.models[modelId]) return;
+			const current = entry.models[modelId];
+			const values = current as unknown as Record<string, unknown>;
+			for (const field of fields) {
+				if (Object.hasOwn(before, field)) values[field] = before[field];
+				else delete values[field];
+			}
+			if (overrideKey && previousOverrides) {
+				// First matching rule wins, so undo must restore the original order too.
+				entry.modelApiOverrides = { ...previousOverrides };
+				if (!previousOverrides[overrideKey]) current.api = current.discoveredApi ?? before.api;
+			}
+		} });
 	}
 
-	private formatMetrics(metrics?: PerformanceMetrics): string {
-		if (!metrics) return "";
-		const time = `${metrics.avgResponseTime}ms`;
-		const tokens = metrics.avgTokens != null ? ` ${this.formatNumber(metrics.avgTokens)}tk` : "";
-		return `${time}${tokens}`;
+	/** Cycle an exact model pin; auto removes it and resumes gateway rules / discovery. */
+	private cycleModelApi(): void {
+		const gateway = this.state.selectedGateway;
+		const entry = this.config.providers[gateway];
+		const row = this.state.filteredRows[this.state.selectedModelIndex];
+		if (!entry || !row) return;
+		const ruleKey = exactApiRule(row.id);
+		const current = entry.modelApiOverrides?.[ruleKey] ?? "auto";
+		const next = API_CYCLE[(API_CYCLE.indexOf(current) + 1) % API_CYCLE.length];
+		this.recordModelEdit(gateway, row.id, `Change API for ${row.id}`, ["api"], ruleKey);
+		const others = Object.fromEntries(Object.entries(entry.modelApiOverrides ?? {}).filter(([key]) => key !== ruleKey));
+		entry.modelApiOverrides = next === "auto" ? others : { [ruleKey]: next, ...others };
+		entry.models[row.id].api = next === "auto" ? entry.models[row.id].discoveredApi ?? entry.defaultApi : next;
+		this.loadModels();
 	}
 
-	private formatNumber(n: number): string {
-		if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
-		return String(n);
-	}
-
-	private formatTestResult(row: ModelRow): string {
-		if (row.testing) return "⧗ testing...";
-		if (row.testResult) {
-			const { passed, total } = row.testResult;
-			if (passed === 0) return `✗ ${passed}/${total}`;
-			if (passed === total) return `✓ ${passed}/${total}`;
-			return `⚠ ${passed}/${total}`;
-		}
-		return this.formatHealth(row.meta.health).symbol;
+	private toggleModelReasoning(): void {
+		const gateway = this.state.selectedGateway;
+		const entry = this.config.providers[gateway];
+		const row = this.state.filteredRows[this.state.selectedModelIndex];
+		if (!entry || !row) return;
+		this.recordModelEdit(gateway, row.id, `Toggle reasoning for ${row.id}`, ["reasoning"]);
+		const meta = entry.models[row.id];
+		meta.reasoning = !modelReasoning(entry, row.id);
+		this.loadModels();
+		this.ctx.ui.notify(`Reasoning ${meta.reasoning ? "enabled" : "disabled"} for ${row.id}`, "info");
 	}
 
 	// ---- rendering ----
 
-	/**
-	 * Pad content to an exact number of visible columns.
-	 *
-	 * Everything here must be measured with visibleWidth rather than .length:
-	 * ANSI styling contributes zero columns, while CJK text and emoji badges
-	 * (⭐ 🗑) each occupy two. Counting code units instead ragged the frame.
-	 */
-	private cell(content: string, width: number): string {
-		const safeWidth = Math.max(0, Math.floor(width));
-		if (safeWidth === 0) return "";
-		const truncated = truncateToWidth(content, safeWidth, "…");
-		return truncated + " ".repeat(Math.max(0, safeWidth - visibleWidth(truncated)));
-	}
-
-	/** One framed body row: `│<left>│<right>│`, both cells measured. */
-	private row(theme: any, left: string, right: string, leftWidth: number, rightWidth: number): string {
-		const bar = theme.fg("accent", "│");
-		return bar + this.cell(left, leftWidth) + bar + this.cell(right, rightWidth) + bar;
-	}
-
-	/**
-	 * Cycle the selected model's API: auto → anthropic-messages → openai-responses
-	 * → openai-completions → auto. A concrete choice is pinned via an exact-match
-	 * rule in modelApiOverrides so refresh (applyDiscovery → resolveApi) keeps it;
-	 * "auto" removes the pin and lets endpoint-type discovery decide again.
-	 */
-	private cycleModelApi(): void {
-		const entry = this.config.providers[this.state.selectedGateway];
-		const row = this.state.filteredRows[this.state.selectedModelIndex];
-		if (!entry || !row || !entry.models[row.id]) return;
-		const meta = entry.models[row.id];
-
-		const rules = compileOverrides(entry.modelApiOverrides ?? {});
-		const pinned = rules.find((r) => r.regex.test(row.id))?.api;
-		const current = pinned ?? "auto";
-		const next = API_CYCLE[(API_CYCLE.indexOf(current) + 1) % API_CYCLE.length];
-
-		entry.modelApiOverrides ??= {};
-		const ruleKey = exactApiRule(row.id);
-		if (next === "auto") {
-			delete entry.modelApiOverrides[ruleKey];
+	render(width: number, height: number, theme: ViewTheme): string[] {
+		if (Date.now() >= this.nextHealthExpiry) this.applyFiltersAndSort();
+		const size = screenSize(width, height);
+		const summary = this.draftSummary();
+		const dirty = summary.total ? "未保存：" + summary.total + " 项" : "已保存";
+		const titles: Partial<Record<TuiMode, string>> = {
+			help: "快捷键帮助", details: "详情", changes: "未保存变更", compare: "网关比较",
+			menu: this.menu?.kind === "filters" ? "筛选模型" : "操作菜单",
+			form: this.form?.editingName ? "编辑网关" : "新增网关", context: "设置上下文", pattern: "批量选择",
+		};
+		const title = beside(titles[this.state.mode] ?? "AI Manager", dirty, size.width);
+		let body: string[];
+		let footer = browseFooter(size.width, this.state.activePane, !!this.activeAbortController);
+		const backFooter = [
+			fitHints(["↑↓ / PgUp PgDn 滚动", ...(this.activeAbortController ? ["Ctrl+C 停止任务"] : [])], size.width),
+			fitHints(["Esc 返回", ": 操作菜单"], size.width),
+		];
+		if (["help", "details", "changes", "compare"].includes(this.state.mode)) {
+			const lines = this.state.mode === "help" ? HELP_TEXT
+				: this.state.mode === "details" ? this.detailLines()
+				: this.state.mode === "changes" ? this.changeLines()
+				: this.panelContent;
+			body = this.renderPanel(lines, size);
+			footer = backFooter;
+			if (this.state.mode === "details" && this.state.activePane === "models") {
+				footer = [fitHints(this.activeAbortController
+					? ["Ctrl+C 停止任务", "设置暂不可改", "↑↓ 滚动"]
+					: [...MODEL_SETTING_COMMANDS.map(commandHint), "↑↓ 滚动"], size.width), backFooter[1]];
+			}
+		} else if (this.menu) {
+			body = this.renderMenu(size, theme);
+			footer = [fitHints(["输入名称或按键搜索", "↑↓ 选择", ...(this.activeAbortController ? ["Ctrl+C 停止"] : [])], size.width), dialogFooter(size.width, "选择", "返回")];
+		} else if (this.state.mode === "form" && this.form) {
+			body = this.renderForm(theme, size);
+			footer = [fitHints(["Tab/Shift+Tab 切字段", "←→ 编辑 / 选择 API", "Ctrl+U 清空"], size.width),
+				this.busy ? "Esc 取消发现及表单" : dialogFooter(size.width, this.form.fieldIndex === 3 ? "应用" : "下一项")];
+		} else if (this.state.mode === "context" && this.contextForm) {
+			const f = this.contextForm;
+			const entry = this.config.providers[this.state.selectedGateway];
+			const limits = entry ? modelLimits(entry, f.modelId) : undefined;
+			const label = size.width >= 20 ? "新长度: " : "";
+			body = [label + f.input.render(theme, size.width - visibleWidth(label)),
+				...wrapLines([
+					...(f.status ? [f.status] : []),
+					...(limits ? [`当前长度：${limits.contextWindow.toLocaleString("en-US")} tokens${limits.estimated ? "（估算）" : ""}`] : []),
+					"空值清除手工设置；支持 128k、256000、1m。", "模型：" + safeDisplay(f.modelId),
+				], size.width)];
+			footer = ["修改只加入草稿", dialogFooter(size.width, "应用")];
+		} else if (this.state.mode === "pattern" && this.pattern) {
+			const label = this.pattern.kind === "enable" ? "启用: " : "禁用: ";
+			body = [label + this.pattern.input.render(theme, Math.max(1, size.width - visibleWidth(label))),
+				...wrapLines(["作用于当前网关的所有模型。支持 * 和 ?，例如 gpt-*。"], size.width)];
+			footer = ["修改只加入草稿", dialogFooter(size.width, "应用")];
+		} else if (this.pendingTest) {
+			const pending = this.pendingTest;
+			const requests = pending.count * Math.min(this.testQuestions().length, TEST_QUESTIONS_PER_MODEL);
+			body = this.renderPanel([
+				pending.count + " models, " + requests + " requests, up to " + requests * 256 + " output tokens.",
+				"批量测试可能收费，价格可能未知；不含输入 token 和网关额外计费。",
+				pending.allGateways ? "范围：所有网关已启用模型。" : "范围：" + pending.gateway + "，筛选后的模型（含未启用）。",
+			], size);
+			footer = ["↑↓ 滚动查看范围", dialogFooter(size.width, "开始测试")];
+		} else if (this.confirmDelete) {
+			const entry = this.config.providers[this.confirmDelete];
+			body = this.renderPanel(["删除网关：" + this.confirmDelete,
+				"将移除 " + (entry?.enabledModels.length ?? 0) + " 个已启用模型。修改先加入草稿，u 可撤销。"], size);
+			footer = ["确认后仍需在主界面保存", dialogFooter(size.width, "确认删除")];
 		} else {
-			entry.modelApiOverrides[ruleKey] = next;
-			meta.api = next;
-		}
-	}
-
-	private toggleModelReasoning(): void {
-		const entry = this.config.providers[this.state.selectedGateway];
-		const row = this.state.filteredRows[this.state.selectedModelIndex];
-		if (!entry || !row || !entry.models[row.id]) return;
-		const meta = entry.models[row.id];
-
-		const current = meta.reasoning ?? inferReasoningSupport(row.id);
-		const next = !current;
-		meta.reasoning = next;
-		row.meta.reasoning = next;
-
-		if (next) {
-			const api = meta.api ?? entry.defaultApi;
-			meta.thinkingLevelMap ??= inferThinkingLevelMap(row.id);
-			meta.compat ??= inferModelCompat(row.id, api);
-		}
-
-		this.operationHistory.record({
-			description: `Toggle reasoning for ${row.id} (${next ? "enabled" : "disabled"})`,
-			undo: () => {
-				meta.reasoning = current;
-				row.meta.reasoning = current;
-			},
-		});
-
-		this.ctx.ui.notify(
-			`Reasoning ${next ? "enabled" : "disabled"} for ${row.id}`,
-			"info",
-		);
-	}
-
-	/** One framed full-width line: `│<content>│`. */
-	private fullRow(theme: any, content: string, w: number): string {
-		return theme.fg("accent", "│") + this.cell(content, w - 2) + theme.fg("accent", "│");
-	}
-
-	render(width: number, height: number, theme: any): string[] {
-		// A component must never render wider than the width supplied by pi.
-		const w = Math.max(1, Math.floor(width));
-		const h = Math.max(1, Math.floor(height));
-		if (w < 20) return [truncateToWidth("AI Gateway", w, "")];
-
-		// For narrow terminals (< 40 cols), render a compact message to avoid layout corruption
-		if (w < 40) {
-			const text = truncateToWidth("AI Gateway Manager (width too narrow)", Math.max(0, w - 2), "");
-			return [
-				theme.fg("accent", "┌" + "─".repeat(Math.max(0, w - 2)) + "┐"),
-				theme.fg("accent", "│") + this.cell(` ${text}`, Math.max(0, w - 2)) + theme.fg("accent", "│"),
-				theme.fg("accent", "└" + "─".repeat(Math.max(0, w - 2)) + "┘"),
+			body = this.renderBrowse(size, theme);
+			if (this.state.isFiltering) footer = [
+				fitHints(["←→ 移动光标", "Home/End 首尾", "Ctrl+U 清空", ...(this.activeAbortController ? ["Ctrl+C 停止"] : [])], size.width),
+				dialogFooter(size.width, "保留搜索", "还原"),
 			];
 		}
-
-		// Chrome is 12 lines (borders, header, column headers, info, separator,
-		// scroll, status, help bar); keep at least 5 model rows even on a short
-		// terminal and cap at 20.
-		this.visibleRows = Math.max(5, Math.min(h - 12, 20));
-		this.clampScroll();
-		this.clampGatewayScroll();
-
-		const lines: string[] = [];
-		const gateways = Object.keys(this.config.providers);
-		const entry = this.config.providers[this.state.selectedGateway];
-
-		const leftWidth = 24;
-		const rightWidth = w - leftWidth - 3;
-
-		// Header
-		lines.push(theme.fg("accent", "┌" + "─".repeat(w - 2) + "┐"));
-		lines.push(
-			theme.fg("accent", "│") + this.cell(` ${theme.bold("AI Gateway 管理中心")}`, w - 2) + theme.fg("accent", "│"),
-		);
-		lines.push(theme.fg("accent", "├" + "─".repeat(w - 2) + "┤"));
-
-		if (this.state.mode === "help") {
-			for (const help of HELP_TEXT.slice(0, this.visibleRows + 4)) {
-				lines.push(this.fullRow(theme, ` ${help}`, w));
-			}
-			lines.push(theme.fg("accent", "└" + "─".repeat(w - 2) + "┘"));
-			return lines.map((line) => padToWidth(line, w));
-		}
-
-		if (this.state.mode === "form" && this.form) {
-			lines.push(...this.renderForm(theme, w));
-			lines.push(theme.fg("accent", "└" + "─".repeat(w - 2) + "┘"));
-			return lines.map((line) => padToWidth(line, w));
-		}
-
-		if (this.state.mode === "context" && this.contextForm) {
-			lines.push(...this.renderContextForm(theme, w));
-			lines.push(theme.fg("accent", "└" + "─".repeat(w - 2) + "┘"));
-			return lines.map((line) => padToWidth(line, w));
-		}
-
-		// Column headers
-		lines.push(
-			this.row(
-				theme,
-				` ${theme.bold(`Gateways (${gateways.length})`)}`,
-				` ${theme.bold(`Models - ${this.state.selectedGateway || "—"}`)}`,
-				leftWidth,
-				rightWidth,
-			),
-		);
-
-		if (entry) {
-			const discovered = Object.keys(entry.models).length;
-			const enabled = entry.enabledModels.length;
-			const filterInfo = this.filterInput.value ? `[Filter: ${this.filterInput.value}] ` : "";
-			const view = `${filterInfo}[Sort: ${this.state.sortMode}] [Quality: ${this.state.qualityFilter}]`;
-			lines.push(
-				this.row(theme, "", ` ${theme.fg("dim", `${discovered} discovered, ${enabled} enabled  ${view}`)}`, leftWidth, rightWidth),
-			);
-		} else {
-			lines.push(this.row(theme, "", "", leftWidth, rightWidth));
-		}
-
-		lines.push(
-			theme.fg("accent", "│") + " ".repeat(leftWidth) + theme.fg("accent", "│") + "─".repeat(rightWidth) + theme.fg("accent", "│"),
-		);
-
-		// Body: gateway list (left) and model list (right) share the rows.
-		const apiRules = entry ? compileOverrides(entry.modelApiOverrides ?? {}) : [];
-		const visibleGateways = gateways.slice(
-			this.state.gatewayScrollOffset,
-			this.state.gatewayScrollOffset + this.visibleRows,
-		);
-		const visibleModels = this.state.filteredRows.slice(
-			this.state.scrollOffset,
-			this.state.scrollOffset + this.visibleRows,
-		);
-
-		for (let i = 0; i < this.visibleRows; i++) {
-			const gateway = visibleGateways[i];
-			let left = "";
-			if (gateway) {
-				const gatewayEntry = this.config.providers[gateway];
-				const isSelected = gateway === this.state.selectedGateway;
-				const paneActive = this.state.activePane === "gateways";
-				const marker = isSelected ? (paneActive ? theme.fg("accent", ">") : theme.fg("dim", ">")) : " ";
-				const configured = this.ctx.modelRegistry.getProviderAuthStatus(gateway).configured;
-				const auth = configured ? theme.fg("success", "✓") : theme.fg("error", "✗");
-				const counts = `${gatewayEntry.enabledModels.length}/${Object.keys(gatewayEntry.models).length}`;
-				left = ` ${marker} ${isSelected && paneActive ? theme.bold(gateway) : gateway} ${auth} ${counts}`;
-			}
-
-			const row = visibleModels[i];
-			let right = "";
-			if (row) {
-				const absoluteIndex = this.state.scrollOffset + i;
-				const isSelected = this.state.activePane === "models" && absoluteIndex === this.state.selectedModelIndex;
-				const marker = isSelected ? theme.fg("accent", ">") : " ";
-				const checkbox = row.enabled ? theme.fg("success", "☑") : "☐";
-
-				let qualityBadge = "";
-				if (row.qualityScore) {
-					if (row.qualityScore.isKnownGood) qualityBadge = theme.fg("success", "⭐");
-					else if (row.qualityScore.isGarbage) qualityBadge = theme.fg("error", "🗑");
-					else if (row.qualityScore.recommendScore >= 60) qualityBadge = theme.fg("dim", "○");
-				}
-
-				const health = this.formatHealth(row.meta.health);
-				const healthSymbol = theme.fg(health.color, health.symbol);
-				const status = `${healthSymbol} ${this.formatTestResult(row)} ${this.formatMetrics(row.meta.metrics)}`;
-				const badge = qualityBadge ? ` ${qualityBadge}` : "";
-				const isReasoning = row.meta.reasoning ?? inferReasoningSupport(row.id);
-				const thinkBadge = isReasoning ? ` ${theme.fg("warning", "🧠")}` : "";
-
-				const pinned = apiRules.find((r) => r.regex.test(row.id))?.api;
-				const effectiveApi = pinned ?? row.meta.api ?? entry?.defaultApi ?? "openai-responses";
-				const apiTag = theme.fg(pinned ? "accent" : "dim", API_TAGS[effectiveApi]);
-
-				right = ` ${marker} ${checkbox} ${row.id}${badge}${thinkBadge} ${apiTag}  ${status}`;
-			}
-
-			lines.push(this.row(theme, left, right, leftWidth, rightWidth));
-		}
-
-		// Scroll indicator
-		{
-			const left =
-				gateways.length > this.visibleRows
-					? ` ${theme.fg("dim", `(${this.state.gatewayScrollOffset + 1}-${Math.min(this.state.gatewayScrollOffset + this.visibleRows, gateways.length)}/${gateways.length})`)}`
-					: "";
-			const right =
-				this.state.filteredRows.length > this.visibleRows
-					? ` ${theme.fg("dim", `(${this.state.scrollOffset + 1}-${Math.min(this.state.scrollOffset + this.visibleRows, this.state.filteredRows.length)}/${this.state.filteredRows.length})`)}`
-					: "";
-			lines.push(this.row(theme, left, right, leftWidth, rightWidth));
-		}
-
-		// Status row: test progress, pattern input, or deletion confirmation.
-		{
-			let status = "";
-			if (this.state.testingInProgress) {
-				const { current, total } = this.state.testProgress;
-				status = ` ${theme.fg("warning", `⧗ Testing ${current}/${total}...`)}`;
-			} else if (this.pattern) {
-				const label = this.pattern.kind === "enable" ? "Enable pattern" : "Disable pattern";
-				status = ` ${theme.fg("accent", `${label}:`)} ${this.pattern.input.render(theme, rightWidth - 6)} ${theme.fg("dim", "(Enter apply, Esc cancel)")}`;
-			} else if (this.confirmDelete) {
-				status = ` ${theme.fg("error", `Delete gateway "${this.confirmDelete}"?`)} ${theme.fg("warning", "D / d / Enter to confirm, Esc to cancel")}`;
-			} else if (this.lastKey === "d") {
-				status = ` ${theme.fg("warning", "d pressed — press d again to delete this gateway, any other key to cancel")}`;
-			}
-			lines.push(this.row(theme, "", status, leftWidth, rightWidth));
-		}
-
-		// Help bar
-		lines.push(theme.fg("accent", "├" + "─".repeat(w - 2) + "┤"));
-
-		const undoHint = this.operationHistory.canUndo()
-			? ` | ${theme.fg("accent", "u")}: undo`
-			: "";
-
-		const helpLines = this.state.isFiltering
-			? ["Type to filter... (Enter: apply, Esc: cancel)"]
-			: [
-					`Space: toggle | g: think | C: context | t: test | T: test all | p: api | a: auto | d: dedup | e/x: pattern${undoHint} | ?: help`,
-					"n: add provider | D/dd: delete | ↑↓←→: nav | /: filter | s: sort | q: quality | r/R/A | Enter/Esc",
-				];
-		for (const help of helpLines) {
-			lines.push(theme.fg("accent", "│") + this.cell(` ${theme.fg("dim", help)}`, w - 2) + theme.fg("accent", "│"));
-		}
-
-		lines.push(theme.fg("accent", "└" + "─".repeat(w - 2) + "┘"));
-
-		return lines.map((line) => padToWidth(line, w));
+		return screen(size, title, body, footer, theme);
 	}
 
-	private renderContextForm(theme: any, w: number): string[] {
-		const f = this.contextForm;
-		if (!f) return [];
-		const current = this.config.providers[this.state.selectedGateway]?.models[f.modelId]?.contextWindow;
-		const currentText = current ? `${current} tokens` : "not configured (Pi default: 256000)";
-		const fieldWidth = w - 14;
-		const field = theme.fg("accent", "› ") + f.input.render(theme, fieldWidth - 2);
+	private renderPanel(lines: readonly string[], size: ScreenSize): string[] {
+		const wrapped = wrapLines(lines, size.width);
+		this.panelLength = wrapped.length;
+		this.panelRows = Math.max(1, size.bodyRows);
+		const offset = this.state.mode === "help" ? this.helpOffset : this.panelOffset;
+		const clamped = Math.max(0, Math.min(offset, wrapped.length - this.panelRows));
+		if (this.state.mode === "help") this.helpOffset = clamped;
+		else this.panelOffset = clamped;
+		return wrapped.slice(clamped, clamped + size.bodyRows);
+	}
+
+	private detailLines(): string[] {
+		const gateway = this.state.selectedGateway;
+		const entry = this.config.providers[gateway];
+		if (!entry) return ["没有选中网关；n 新增网关。"];
+		const selected = this.state.filteredRows[this.state.selectedModelIndex];
+		if (this.state.activePane === "models") return selected ? modelDetails(gateway, entry, selected, this.secretValues()) : ["没有匹配的模型；f 调整筛选。"];
+		const auth = this.ctx.modelRegistry.getProviderAuthStatus(gateway);
+		const source = auth.source === "runtime" ? "Pi 运行时凭据" : auth.source === "stored" ? "Pi 登录凭据"
+			: entry.apiKeyEnv ? "环境变量引用" : entry.apiKey ? "配置中的密钥" : "Pi 凭据";
 		return [
-			this.fullRow(theme, ` ${theme.bold("Set context window")} ${theme.fg("dim", "(Esc cancels)")}`, w),
-			this.fullRow(theme, ` Model: ${f.modelId}`, w),
-			this.fullRow(theme, ` Current: ${theme.fg("dim", currentText)}`, w),
-			theme.fg("accent", "│") + this.cell(" New length", 12) + this.cell(field, fieldWidth) + theme.fg("accent", "│"),
-			this.fullRow(theme, ` ${f.status || "Enter tokens, or use 128k / 1m. Enter saves; blank clears the override."}`, w),
-			this.fullRow(theme, theme.fg("dim", " Examples: 128k, 256000, 1m | Enter: save | Esc: cancel"), w),
+			"网关：" + safeDisplay(gateway),
+			"连接地址：" + safeDisplay(entry.baseUrl),
+			"默认协议：" + entry.defaultApi,
+			"凭据：" + (hasProviderAuth(this.ctx, gateway, entry) ? "已配置" : "未配置") + "；来源：" + source,
+			"凭据已配置只表示存在凭据，不代表已验证连通性。",
+			"模型：已启用 " + entry.enabledModels.length + " / 共 " + Object.keys(entry.models).length,
 		];
 	}
 
-	private renderForm(theme: any, w: number): string[] {
-		const f = this.form;
-		if (!f) return [];
-		const lines: string[] = [this.fullRow(theme, ` ${theme.bold("Add provider")}${theme.fg("dim", "  (Esc cancels)")}`, w)];
+	private changeLines(): string[] {
+		const summary = this.draftSummary();
+		if (!summary.total) return ["没有未保存的更改。"];
+		return [
+			"配置 " + summary.config + " 项；测试 " + summary.test + " 项；发现 " + summary.discovery + " 项。",
+			"Enter / Ctrl+S 在主界面保存全部草稿；u 撤销最近的配置操作。",
+			...(["config", "test", "discovery"] as const).flatMap(kind => summary.changes.filter(change => change.kind === kind)
+				.map(change => "[" + ({ config: "配置", test: "测试", discovery: "发现" }[kind]) + "] " + change.text)),
+		];
+	}
 
-		const labels = ["Name", "Base URL", "API Key"] as const;
-		const labelWidth = 10;
-		const fieldWidth = w - 2 - labelWidth - 2;
-		for (let i = 0; i < 3; i++) {
-			const focused = f.fieldIndex === i;
-			const label = focused ? theme.bold(` ${labels[i]}`) : theme.fg("dim", ` ${labels[i]}`);
-			const field = focused
-				? theme.fg("accent", "› ") + f.fields[i].render(theme, fieldWidth - 2)
-				: "  " + theme.fg("dim", i === 2 ? "*".repeat(Math.min(f.fields[2].value.length, fieldWidth - 2)) : truncateToWidth(f.fields[i].value, fieldWidth - 2));
-			lines.push(
-				theme.fg("accent", "│") +
-					this.cell(label, labelWidth) +
-					this.cell(field, fieldWidth) +
-					theme.fg("accent", "│"),
-			);
+	private gatewayLine(name: string | undefined, width: number, theme: ViewTheme): string {
+		if (!name) return "";
+		const entry = this.config.providers[name];
+		const selected = name === this.state.selectedGateway;
+		const label = (selected ? "> " : "  ") + safeDisplay(name);
+		const counts = entry.enabledModels.length + "/" + Object.keys(entry.models).length;
+		return beside(selected && this.state.activePane === "gateways" ? theme.bold(label) : label, counts, width);
+	}
+
+	private renderBrowse(size: ScreenSize, theme: ViewTheme): string[] {
+		const { width: w, bodyRows } = size;
+		const lines: string[] = [];
+		const gateways = Object.keys(this.config.providers);
+		const entry = this.config.providers[this.state.selectedGateway];
+		const total = this.state.modelRows.length;
+		const matched = this.state.filteredRows.length;
+		const selected = this.state.filteredRows[this.state.selectedModelIndex];
+		const apiRules = compileOverrides(entry?.modelApiOverrides ?? {});
+		const settings = this.state.activePane === "models" && entry && selected && !this.state.isFiltering && w >= 20 && bodyRows >= 5
+			? modelSettingsLines(entry, selected, w, apiRules) : [];
+		const listRows = bodyRows - settings.length;
+		const dual = w >= 90;
+		const leftWidth = dual ? Math.min(26, Math.floor(w / 4)) : w;
+		const rightWidth = dual ? w - leftWidth - 3 : w;
+		const pair = (left: string, right: string) => dual
+			? cell(left, leftWidth) + theme.fg("accent", " │ ") + cell(right, rightWidth)
+			: cell(this.state.activePane === "gateways" ? left : right, w);
+		const search = () => {
+			const label = w >= 20 ? "搜索: " : "/";
+			return label + this.filterInput.render(theme, w - visibleWidth(label));
+		};
+		if (this.state.isFiltering && bodyRows <= 1) return [search()];
+		if (listRows >= 3) {
+			lines.push(beside((this.state.activePane === "models" ? "模型 · " : "网关 · ") + (this.state.selectedGateway || "未配置"),
+				"显示 " + matched + "/" + total + " · 启用 " + (entry?.enabledModels.length ?? 0), w));
 		}
+		if (listRows >= 5 || this.state.isFiltering) {
+			lines.push(this.state.isFiltering ? search() : cell("f 筛选:" + FILTER_LABELS[this.state.filterMode] +
+				"  q 质量:" + QUALITY_LABELS[this.state.qualityFilter] + "  s 排序:" + SORT_LABELS[this.state.sortMode] +
+				(this.filterInput.value ? "  / " + this.filterInput.value : ""), w));
+		}
+		const progress = this.state.testingInProgress ? " " + this.state.testProgress.current + "/" + this.state.testProgress.total : "";
+		const status = this.activeAbortController ? this.taskLabel + progress + " · Ctrl+C 停止" : this.notice;
+		if (status && listRows - lines.length >= 3) lines.push(theme.fg("warning", cell(status, w)));
+		if (listRows - lines.length >= 2) lines.push(pair(
+			(this.state.activePane === "gateways" ? "> " : "  ") + "网关 · 启用/总数",
+			modelHeader(rightWidth),
+		));
+		this.visibleRows = Math.max(1, listRows - lines.length);
+		this.clampScroll();
+		this.clampGatewayScroll();
+		for (let i = 0; i < this.visibleRows; i++) {
+			const gateway = gateways[this.state.gatewayScrollOffset + i];
+			const index = this.state.scrollOffset + i;
+			const row = this.state.filteredRows[index];
+			const left = this.gatewayLine(gateway, leftWidth, theme) || (i === 0 && !gateways.length ? "n 新增网关" : "");
+			const right = row ? modelLine(row, entry, this.state.activePane === "models" && index === this.state.selectedModelIndex, rightWidth, theme, apiRules)
+				: i === 0 && !matched ? (total ? "没有匹配模型 · f 重置筛选" : "没有模型 · r 发现 / n 新增") : "";
+			lines.push(pair(left, right));
+		}
+		lines.push(...settings);
+		this.rememberModelView();
+		return lines;
+	}
 
-		// API field
-		const apiFocused = f.fieldIndex === 3;
-		const api = API_CHOICES[f.apiIndex];
-		const detectNote =
-			f.detectState === "detecting"
-				? theme.fg("warning", "detecting…")
-				: f.detectState === "done" && f.statusKind === "info"
-					? theme.fg("dim", f.status)
-					: theme.fg("dim", "←→ to change");
-		const apiLine = ` ${apiFocused ? theme.bold("API") : theme.fg("dim", "API")}  ${apiFocused ? theme.fg("accent", api) : api}  ${detectNote}`;
-		lines.push(this.fullRow(theme, apiLine, w));
+	private renderForm(theme: ViewTheme, size: ScreenSize): string[] {
+		const f = this.form!;
+		const labels = size.width >= 32 ? ["名称: ", "地址: ", "密钥: "] : size.width >= 12 ? ["名:", "址:", "钥:"] : ["", "", ""];
+		const fields = f.fields.map((field, index) => {
+			const label = labels[index];
+			const width = Math.max(0, size.width - visibleWidth(label));
+			const shown = index === f.fieldIndex ? field.render(theme, width)
+				: theme.fg("dim", truncateToWidth(index === 2 ? "*".repeat(field.value.length) : field.value, width, "…"));
+			return (index === f.fieldIndex ? theme.fg("accent", label) : label) + shown;
+		});
+		fields.push((f.fieldIndex === 3 ? "> API: " : "  API: ") + API_CHOICES[f.apiIndex]);
+		const status = wrapLines([f.status || "在 API 字段按 Enter 将更改加入草稿。"], size.width);
+		const statusRows = size.bodyRows >= 2 ? Math.min(status.length, Math.max(1, size.bodyRows - 4)) : 0;
+		const fieldRows = Math.max(1, size.bodyRows - statusRows);
+		this.formOffset = focusOffset(f.fieldIndex, this.formOffset, fields.length, fieldRows);
+		const lines = fields.slice(this.formOffset, this.formOffset + fieldRows);
+		while (lines.length < fieldRows) lines.push("");
+		const color = f.statusKind === "error" ? "error" : f.statusKind === "warning" ? "warning" : "dim";
+		lines.push(...status.slice(0, statusRows).map(line => theme.fg(color, line)));
+		return lines;
+	}
 
-		// Status message
-		const statusColor = f.statusKind === "error" ? "error" : f.statusKind === "warning" ? "warning" : "dim";
-		lines.push(this.fullRow(theme, ` ${f.status ? theme.fg(statusColor, f.status) : theme.fg("dim", "Enter on the API field saves the provider")}`, w));
+	private commandBlocked(command: Command): string | undefined {
+		if (this.activeAbortController && !command.readOnly) return "任务进行中，请先停止";
+		if (command.pane && this.state.activePane !== command.pane) return "请先切换到" + (command.pane === "models" ? "模型栏" : "网关栏");
+		if (command.needs === "gateway" && !this.config.providers[this.state.selectedGateway]) return "没有选中网关";
+		if (command.needs === "model" && !this.state.filteredRows[this.state.selectedModelIndex]) return "没有选中模型";
+		if (command.needs === "history" && !this.operationHistory.canUndo()) return "没有可撤销的操作";
+		if (command.needs === "task" && !this.activeAbortController) return "没有进行中的任务";
+		return undefined;
+	}
 
-		lines.push(this.fullRow(theme, theme.fg("dim", " ↑↓/Tab: fields | Enter: next (save on API) | ←→: cycle API | Esc: cancel"), w));
+	private menuItems(): MenuItem[] {
+		if (!this.menu) return [];
+		const query = this.menu.input.value.toLowerCase();
+		const items: MenuItem[] = this.menu.kind === "actions"
+			? (COMMANDS as readonly Command[]).filter(command => command.id !== "actions").map(command => {
+				const reason = this.commandBlocked(command);
+				return { id: command.id, label: command.label, hint: reason ?? command.keyHint, enabled: !reason };
+			})
+			: [
+				...Object.entries(FILTER_LABELS).map(([mode, label]) => ({ id: "filter:" + mode, label: "状态 · " + label, hint: "", enabled: true, checked: this.state.filterMode === mode })),
+				...Object.entries(QUALITY_LABELS).map(([mode, label]) => ({ id: "quality:" + mode, label: "质量 · " + label, hint: "", enabled: true, checked: this.state.qualityFilter === mode })),
+				{ id: "reset", label: "重置所有筛选和搜索", hint: "", enabled: true },
+			];
+		return items.filter(item => (item.label + " " + item.id + " " + item.hint).toLowerCase().includes(query));
+	}
 
-		while (lines.length < this.visibleRows + 4) lines.push(this.fullRow(theme, "", w));
-		return lines.slice(0, this.visibleRows + 4);
+	private renderMenu(size: ScreenSize, theme: ViewTheme): string[] {
+		const menu = this.menu!;
+		const items = this.menuItems();
+		menu.index = Math.max(0, Math.min(menu.index, items.length - 1));
+		this.menuRows = Math.max(1, size.bodyRows - 1);
+		menu.offset = focusOffset(menu.index, menu.offset, items.length, this.menuRows);
+		const label = size.width >= 20 ? "查找: " : "/";
+		const lines = [label + menu.input.render(theme, size.width - visibleWidth(label))];
+		if (size.bodyRows <= 1) return [items[menu.index] ? "> " + items[menu.index].label : "没有匹配操作"];
+		for (let i = menu.offset; i < Math.min(items.length, menu.offset + this.menuRows); i++) {
+			const item = items[i];
+			const prefix = (i === menu.index ? "> " : "  ") + (item.checked === undefined ? "" : item.checked ? "[x] " : "[ ] ");
+			const line = beside(prefix + item.label, item.hint, size.width);
+			lines.push(item.enabled ? i === menu.index ? theme.fg("accent", line) : line : theme.fg("dim", line));
+		}
+		if (!items.length) lines.push("没有匹配操作；Ctrl+U 清空搜索");
+		return lines;
 	}
 
 	private selectGateway(offset: number): void {
@@ -727,246 +753,94 @@ export class RelayManagerTUI {
 		const nextGateway = gateways[nextIndex];
 		if (!nextGateway || nextGateway === this.state.selectedGateway) return;
 		this.state.selectedGateway = nextGateway;
-		this.state.selectedModelIndex = 0;
-		this.state.scrollOffset = 0;
 		this.loadModels();
 	}
 
-	private async testModels(modelIds: string[]): Promise<void> {
-		this.abortActiveTasks();
-		const abortController = new AbortController();
-		this.activeAbortController = abortController;
-		const signal = abortController.signal;
-
-		this.state.testingInProgress = true;
-		this.state.testProgress = { current: 0, total: modelIds.length };
-
-		const questions =
-			this.config.settings.testQuestions && this.config.settings.testQuestions.length > 0
-				? this.config.settings.testQuestions
-				: [...DEFAULT_TEST_QUESTIONS];
-
-		const concurrency = this.config.settings.testConcurrency ?? DEFAULT_TEST_CONCURRENCY;
-		const delayMs = this.config.settings.testRequestDelayMs ?? DEFAULT_TEST_REQUEST_DELAY_MS;
-		const rateLimiter = new RateLimiter(delayMs);
-
-		const targetGateway = this.state.selectedGateway;
-		const entry = this.config.providers[targetGateway];
-		if (!entry) {
-			this.state.testingInProgress = false;
-			return;
-		}
-
-		// Register the union of the enabled set and the models under test. Testing
-		// a currently-disabled model still has to reach the registry, but
-		// narrowing registration to just the tested ones would hide every other
-		// model from the user mid-run.
-		const underTest = [...new Set([...entry.enabledModels, ...modelIds])];
-		registerProviderFor(this.pi, targetGateway, entry, underTest);
-
-		try {
-			const results = await testModelsInParallel(
-				this.ctx,
-				targetGateway,
-				modelIds,
-				questions,
-				concurrency,
+	private async testModels(modelIds: string[], gateway = this.state.selectedGateway): Promise<void> {
+		const entry = this.config.providers[gateway];
+		if (!entry) return;
+		await this.runTask(async controller => {
+			this.state.testingInProgress = true;
+			this.state.testProgress = { current: 0, total: modelIds.length };
+			this.taskLabel = `测试 ${gateway}`;
+			const key = await providerApiKey(this.ctx, gateway, entry);
+			if (!this.taskIsCurrent(controller)) return;
+			if (key) this.sessionSecrets.add(key);
+			const questions = this.testQuestions();
+			const rateLimiter = new RateLimiter(this.config.settings.testRequestDelayMs ?? DEFAULT_TEST_REQUEST_DELAY_MS);
+			this.registerTemporary(gateway, entry, [...new Set([...entry.enabledModels, ...modelIds])]);
+			let completed = 0;
+			await testModelsInParallel(
+				this.ctx, gateway, modelIds, questions,
+				this.config.settings.testConcurrency ?? DEFAULT_TEST_CONCURRENCY,
 				rateLimiter,
-				(modelId, current, total) => {
-					this.state.testProgress = { current, total };
-					const row = this.state.modelRows.find(r => r.id === modelId);
-					if (row) row.testing = true;
+				(modelId) => {
+					if (!this.taskIsCurrent(controller)) return;
+					this.beginModelTest(gateway, modelId);
+				}, controller.signal,
+				(modelId, result) => {
+					if (!this.taskIsCurrent(controller)) return;
+					this.recordTestResult(gateway, modelId, result);
+					this.state.testProgress = { current: ++completed, total: modelIds.length };
+					this.requestRender();
 				},
-				signal,
+				this.secretValues(),
 			);
-
-			if (signal.aborted || this.isClosed) {
-				return;
-			}
-
-			for (const [modelId, result] of results.entries()) {
-				const row = this.state.modelRows.find(r => r.id === modelId);
-				if (row) {
-					row.testing = false;
-					row.testResult = result;
-				}
-				const modelMeta = entry.models[modelId];
-				if (modelMeta) applyTestResultToMeta(modelMeta, result);
-			}
-
-			writeConfig(this.config);
-			if (this.state.selectedGateway === targetGateway) {
-				this.applyFiltersAndSort();
-			}
-		} finally {
-			this.state.testingInProgress = false;
-			for (const row of this.state.modelRows) row.testing = false;
-			if (this.activeAbortController === abortController) {
-				this.activeAbortController = null;
-			}
-			// Back to the enabled-only registration for targetGateway.
-			if (!signal.aborted && !this.isClosed) {
-				registerProviderFor(this.pi, targetGateway, entry);
-			}
-		}
+			if (this.taskIsCurrent(controller)) this.applyFiltersAndSort();
+		});
 	}
 
-	private async probeContextWindow(modelId: string): Promise<void> {
-		const targetGateway = this.state.selectedGateway;
-		const entry = this.config.providers[targetGateway];
-		if (!entry) return;
-
-		const modelMeta = entry.models[modelId];
-		if (!modelMeta) return;
-
-		this.ctx.ui.setStatus("ai-manager", `probing context window for ${modelId}…`);
-
-		// Temporarily register this model for testing
-		const underTest = [...new Set([...entry.enabledModels, modelId])];
-		registerProviderFor(this.pi, targetGateway, entry, underTest);
-
-		try {
-			const { probeContextWindow } = await import("./testing.ts");
-			const detectedWindow = await probeContextWindow(
-				this.ctx,
-				targetGateway,
-				modelId,
-				modelMeta.contextWindow,
-				this.activeAbortController?.signal,
-			);
-
-			if (this.isClosed) return;
-
-			if (detectedWindow !== undefined) {
-				modelMeta.contextWindow = detectedWindow;
-				writeConfig(this.config);
-				if (this.state.selectedGateway === targetGateway) {
-					this.loadModels();
-				}
-				this.ctx.ui.notify(`Context window for "${modelId}": ${detectedWindow} tokens`, "info");
-			} else {
-				this.ctx.ui.notify(`Could not detect context window for "${modelId}"`, "warning");
-			}
-		} catch (error) {
-			if (!this.isClosed) {
-				this.ctx.ui.notify(
-					`Context probe failed: ${error instanceof Error ? error.message : String(error)}`,
-					"error",
-				);
-			}
-		} finally {
-			// Back to the enabled-only registration
-			registerProviderFor(this.pi, targetGateway, entry);
-			this.ctx.ui.setStatus("ai-manager", "");
-		}
+	private testQuestions(): string[] {
+		return this.config.settings.testQuestions?.length ? this.config.settings.testQuestions : [...DEFAULT_TEST_QUESTIONS];
 	}
 
 	private async refreshModels(): Promise<void> {
-		const targetGateway = this.state.selectedGateway;
-		const entry = this.config.providers[targetGateway];
+		const gateway = this.state.selectedGateway;
+		const entry = this.config.providers[gateway];
 		if (!entry) return;
-
-		try {
-			const apiKey = entry.apiKey ?? (await this.ctx.modelRegistry.getApiKeyForProvider(targetGateway));
-			this.ctx.ui.setStatus("ai-manager", `discovering ${targetGateway}…`);
-
-			const list = await fetchModelList(entry.baseUrl, apiKey);
-			if (this.isClosed) return;
+		await this.runTask(async controller => {
+			this.taskLabel = `发现 ${gateway}`;
+			this.ctx.ui.setStatus("ai-manager", `Discovering ${gateway}…`);
+			const key = await providerApiKey(this.ctx, gateway, entry);
+			if (!this.taskIsCurrent(controller)) return;
+			const list = await fetchModelList(entry.baseUrl, key, { signal: controller.signal, allowInsecureHttp: entry.allowInsecureHttp });
+			if (!this.taskIsCurrent(controller)) return;
 			applyDiscovery(entry, list);
-
-			writeConfig(this.config);
-			if (this.state.selectedGateway === targetGateway) {
-				this.loadModels();
-			}
-			this.ctx.ui.notify(`Discovered ${list.length} models for "${targetGateway}"`, "info");
-		} catch (error) {
-			if (!this.isClosed) {
-				this.ctx.ui.notify(
-					`Discovery failed: ${error instanceof Error ? error.message : String(error)}`,
-					"error",
-				);
-			}
-		} finally {
-			this.ctx.ui.setStatus("ai-manager", undefined);
-		}
+			this.draftCache = null;
+			if (this.state.selectedGateway === gateway) this.loadModels();
+			this.notice = `已发现 ${gateway} 的 ${list.length} 个模型；Enter 保存草稿。`;
+			this.ctx.ui.notify(`Discovered ${list.length} models for ${gateway}. Enter saves the draft.`, "info");
+		});
 	}
 
 	private save(): boolean {
 		try {
-			writeConfigSync(this.config);
+			// Validate registration before committing files. Restore persisted providers on failure.
+			for (const [name, entry] of Object.entries(this.config.providers)) this.registerTemporary(name, entry);
+			const merged = commitConfig(this.baseline, this.config);
+			const previousNames = new Set([...Object.keys(this.baseline.providers), ...this.temporaryProviders]);
+			this.config = merged;
+			this.baseline = cloneConfig(merged);
+			this.draftCache = null;
+			for (const name of previousNames) {
+				if (!merged.providers[name]) this.pi.unregisterProvider(name);
+			}
+			for (const [name, entry] of Object.entries(merged.providers)) registerProviderFor(this.pi, name, entry);
+			this.temporaryProviders.clear();
+			return true;
 		} catch (error) {
-			this.ctx.ui.notify(
-				`Failed to save configuration: ${error instanceof Error ? error.message : String(error)}`,
-				"error",
-			);
+			this.reportError(error);
+			try { this.restoreTemporaryProviders(); } catch (restoreError) { this.reportError(restoreError); }
 			return false;
 		}
-
-		// Every gateway, not just the selected one: the user can toggle models in
-		// several gateways in one session, and writeConfig persists all of them.
-		// Syncing only the visible one silently strands the rest — they land in
-		// provider-ai.json but never reach pi or settings.json.
-		for (const [name, entry] of Object.entries(this.config.providers)) {
-			registerProviderFor(this.pi, name, entry);
-			syncScopedModels(name, entry);
-		}
-		return true;
 	}
 
-	/**
-	 * Undo selection and model configuration changes on Esc.
-	 *
-	 * Restores launch-time selections, model APIs, overrides, and reasoning settings.
-	 * Health/metrics/discovery data gathered along the way is telemetry and is deliberately kept.
-	 * Providers added or deleted mid-session are also kept: those are committed actions.
-	 */
+	/** Discard the draft; cancellation never writes an old snapshot to disk. */
 	private cancel(): void {
-		let reverted = false;
-		for (const [name, initialState] of this.initialProvidersState) {
-			const entry = this.config.providers[name];
-			if (!entry) continue;
-
-			// Restore enabled models
-			entry.enabledModels = [...initialState.enabledModels];
-
-			// Restore model API overrides
-			entry.modelApiOverrides = { ...initialState.modelApiOverrides };
-
-			// Restore model configs (api, reasoning, etc.) while preserving telemetry (health/metrics)
-			for (const [id, initialMeta] of Object.entries(initialState.models)) {
-				const currentMeta = entry.models[id];
-				if (!currentMeta) {
-					entry.models[id] = JSON.parse(JSON.stringify(initialMeta));
-				} else {
-					currentMeta.api = initialMeta.api;
-					currentMeta.reasoning = initialMeta.reasoning;
-					currentMeta.thinkingMode = initialMeta.thinkingMode;
-					currentMeta.thinkingEffort = initialMeta.thinkingEffort;
-					currentMeta.thinkingLevelMap = initialMeta.thinkingLevelMap ? { ...initialMeta.thinkingLevelMap } : undefined;
-					currentMeta.compat = initialMeta.compat ? { ...initialMeta.compat } : undefined;
-					currentMeta.contextWindow = initialMeta.contextWindow;
-					currentMeta.maxTokens = initialMeta.maxTokens;
-					currentMeta.input = initialMeta.input ? [...initialMeta.input] : undefined;
-				}
-			}
-
-			// Clean up any models that were temporarily discovered mid-session and not part of initial config
-			for (const id of Object.keys(entry.models)) {
-				if (!(id in initialState.models)) {
-					delete entry.models[id];
-				}
-			}
-
-			reverted = true;
-		}
-
-		if (!reverted) return;
-		writeConfigSync(this.config);
-		// A mid-session test registered providers with the modified list; put
-		// pi's registry back in sync with what is now on disk.
-		for (const [name, entry] of Object.entries(this.config.providers)) {
-			registerProviderFor(this.pi, name, entry);
-		}
+		this.abortActiveTasks();
+		this.config = cloneConfig(this.baseline);
+		this.draftCache = null;
+		this.operationHistory.clear();
 	}
 
 	// ---- batch actions ----
@@ -980,7 +854,7 @@ export class RelayManagerTUI {
 		const allModelIds = Object.keys(entry.models);
 		const recommended = allModelIds.filter(id => {
 			const score = scoreModel(id);
-			return score.recommendScore >= 60 && !score.isGarbage;
+			return score.recommendScore >= 60 && !score.isGarbage && entry.models[id].health?.status !== "down";
 		});
 
 		// Merge: keep user's existing manual selections, add recommended ones
@@ -1046,56 +920,20 @@ export class RelayManagerTUI {
 		}
 	}
 
-	private async compareModel(): Promise<void> {
-		const targetGateway = this.state.selectedGateway;
-		const entry = this.config.providers[targetGateway];
+	private compareModel(): void {
 		const row = this.state.filteredRows[this.state.selectedModelIndex];
-		if (!entry || !row) return;
-
-		const instances: Array<{ gateway: string; metrics?: PerformanceMetrics; health?: HealthStatus }> = [];
-		const normalizedName = normalizeModelName(row.id);
-
-		for (const [gatewayName, gatewayEntry] of Object.entries(this.config.providers)) {
-			for (const [modelId, meta] of Object.entries(gatewayEntry.models)) {
-				if (normalizeModelName(modelId) === normalizedName) {
-					instances.push({ gateway: gatewayName, metrics: meta.metrics, health: meta.health });
-				}
+		if (!row) return;
+		const lines = [`模型：${row.id}`, "仅比较已有记录，不发送新请求。"];
+		for (const [gateway, entry] of Object.entries(this.config.providers)) {
+			for (const [id, meta] of Object.entries(entry.models)) {
+				if (normalizeModelName(id) !== normalizeModelName(row.id)) continue;
+				const status = effectiveHealth(meta.health);
+				lines.push(`${safeDisplay(gateway)} / ${safeDisplay(id)}：${status}，成功延迟 ${meta.metrics?.avgResponseTime ?? "—"}ms；${recordTime(meta.health?.lastCheck)}`);
 			}
 		}
-
-		if (instances.length <= 1) {
-			this.ctx.ui.notify(`Model "${row.id}" not found in other gateways`, "info");
-			return;
-		}
-
-		// Ensure provider is registered for comparison, and always restore targetGateway in finally
-		registerProviderFor(this.pi, targetGateway, entry);
-		try {
-			const model = this.ctx.modelRegistry.find(targetGateway, row.id);
-			if (model) {
-				await this.ctx.modelRegistry.complete(
-					model,
-					{
-						systemPrompt: "Benchmark",
-						messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
-					},
-					{ maxTokens: 16, timeoutMs: 5000 },
-				);
-			}
-		} catch {
-			// Ignore comparison probe errors
-		} finally {
-			registerProviderFor(this.pi, targetGateway, entry);
-		}
-
-		const lines: string[] = [`\nModel: ${row.id}`, `Found in ${instances.length} gateway(s):\n`];
-		for (const inst of instances) {
-			const time = inst.metrics?.avgResponseTime ?? "?";
-			const health = inst.health?.status ?? "unknown";
-			lines.push(`  ${inst.gateway}: ${time}ms (${health})`);
-		}
-
-		this.ctx.ui.notify(lines.join("\n"), "info");
+		this.panelContent = lines;
+		this.panelOffset = 0;
+		this.state.mode = "compare";
 	}
 
 	private applyPattern(pattern: string, enable: boolean): void {
@@ -1148,590 +986,482 @@ export class RelayManagerTUI {
 	}
 
 	private async refreshAllGateways(): Promise<void> {
-		const gatewayNames = Object.keys(this.config.providers);
-		let successCount = 0;
-		let failCount = 0;
-
-		this.ctx.ui.setStatus("ai-manager", `Refreshing ${gatewayNames.length} gateways…`);
-
-		for (const name of gatewayNames) {
-			const gatewayEntry = this.config.providers[name];
-			try {
-				const apiKey = gatewayEntry.apiKey ?? (await this.ctx.modelRegistry.getApiKeyForProvider(name));
-				const list = await fetchModelList(gatewayEntry.baseUrl, apiKey);
-				applyDiscovery(gatewayEntry, list);
-				successCount++;
-			} catch {
-				failCount++;
+		await this.runTask(async controller => {
+			let successful = 0;
+			const entries = Object.entries(this.config.providers);
+			for (const [name, entry] of entries) {
+				if (!this.taskIsCurrent(controller)) return;
+				this.taskLabel = `发现 ${name}（${successful}/${entries.length}）`;
+				this.requestRender();
+				this.ctx.ui.setStatus("ai-manager", `Discovering ${name}…`);
+				try {
+					const key = await providerApiKey(this.ctx, name, entry);
+					if (!this.taskIsCurrent(controller)) return;
+					const list = await fetchModelList(entry.baseUrl, key, { signal: controller.signal, allowInsecureHttp: entry.allowInsecureHttp });
+					if (!this.taskIsCurrent(controller)) return;
+					applyDiscovery(entry, list);
+					this.draftCache = null;
+					if (this.state.selectedGateway === name) this.loadModels();
+					successful++;
+				} catch (error) {
+					if (!this.taskIsCurrent(controller)) return;
+					this.reportError(error);
+				}
 			}
-		}
-
-		writeConfig(this.config);
-		this.loadModels();
-		this.ctx.ui.setStatus("ai-manager", undefined);
-		this.ctx.ui.notify(
-			`Refreshed ${successCount}/${gatewayNames.length} gateways (${failCount} failed)`,
-			"info",
-		);
+			if (!this.taskIsCurrent(controller)) return;
+			this.loadModels();
+			this.notice = `已刷新 ${successful}/${entries.length} 个网关；Enter 保存草稿。`;
+			this.ctx.ui.notify(`Refreshed ${successful}/${entries.length} gateways. Enter saves the draft.`, "info");
+		});
 	}
 
-	/**
-	 * Parallelized: tests all gateways concurrently with a shared RateLimiter
-	 * to control total concurrency.
-	 */
 	private async testAllGateways(): Promise<void> {
-		this.abortActiveTasks();
-		const abortController = new AbortController();
-		this.activeAbortController = abortController;
-		const signal = abortController.signal;
-
-		const gatewayNames = Object.keys(this.config.providers);
-		let totalTested = 0;
-		let totalPassed = 0;
-
-		this.ctx.ui.setStatus("ai-manager", `Testing all gateways…`);
-
-		const questions =
-			this.config.settings.testQuestions && this.config.settings.testQuestions.length > 0
-				? this.config.settings.testQuestions
-				: [...DEFAULT_TEST_QUESTIONS];
-
-		const concurrency = this.config.settings.testConcurrency ?? DEFAULT_TEST_CONCURRENCY;
-		const delayMs = this.config.settings.testRequestDelayMs ?? DEFAULT_TEST_REQUEST_DELAY_MS;
-
-		// Shared rate limiter across all gateways
-		const sharedRateLimiter = new RateLimiter(delayMs);
-
-		// Build a flat list of {gateway, modelId} pairs
-		const allTasks: Array<{ gateway: string; modelId: string }> = [];
-		for (const name of gatewayNames) {
-			const gatewayEntry = this.config.providers[name];
-			for (const modelId of gatewayEntry.enabledModels) {
-				if (modelId in gatewayEntry.models) {
-					allTasks.push({ gateway: name, modelId });
+		await this.runTask(async controller => {
+			const tasks = Object.entries(this.config.providers).flatMap(([gateway, entry]) =>
+				entry.enabledModels.filter(id => Object.hasOwn(entry.models, id)).map(modelId => ({ gateway, modelId })));
+			if (!tasks.length) return;
+			this.state.testingInProgress = true;
+			this.state.testProgress = { current: 0, total: tasks.length };
+			this.taskLabel = "测试所有网关";
+			const questions = this.testQuestions();
+			const limiters = new Map<string, RateLimiter>();
+			for (const gateway of new Set(tasks.map(task => task.gateway))) {
+				const key = await providerApiKey(this.ctx, gateway, this.config.providers[gateway]);
+				if (!this.taskIsCurrent(controller)) return;
+				if (key) this.sessionSecrets.add(key);
+				this.registerTemporary(gateway, this.config.providers[gateway]);
+				limiters.set(gateway, new RateLimiter(this.config.settings.testRequestDelayMs ?? DEFAULT_TEST_REQUEST_DELAY_MS));
+			}
+			let next = 0;
+			let completed = 0;
+			const worker = async () => {
+				while (next < tasks.length && this.taskIsCurrent(controller)) {
+					const index = next++;
+					const { gateway, modelId } = tasks[index];
+					this.beginModelTest(gateway, modelId);
+					const result = await testModelFn(this.ctx, gateway, modelId, pickQuestions(questions, index), limiters.get(gateway)!, controller.signal, this.secretValues());
+					if (!this.taskIsCurrent(controller)) return;
+					this.recordTestResult(gateway, modelId, result);
+					this.state.testProgress = { current: ++completed, total: tasks.length };
+					this.requestRender();
 				}
-			}
-		}
-
-		if (allTasks.length === 0) {
-			this.ctx.ui.setStatus("ai-manager", undefined);
-			return;
-		}
-
-		// Parallel worker pool across all gateways
-		const queue = [...allTasks];
-		let completed = 0;
-
-		async function workerFn(this: RelayManagerTUI): Promise<void> {
-			while (queue.length > 0) {
-				if (signal.aborted || this.isClosed) break;
-				const task = queue.shift();
-				if (!task) break;
-
-				const { gateway, modelId } = task;
-				const meta = this.config.providers[gateway]?.models[modelId];
-				if (!meta) continue;
-
-				// Ensure provider is registered
-				registerProviderFor(this.pi, gateway, this.config.providers[gateway]);
-
-				const chosen = pickQuestions(questions, completed);
-				try {
-					const result = await testModelFn(this.ctx, gateway, modelId, chosen, sharedRateLimiter, signal);
-					if (!result.skipped) {
-						totalTested++;
-						totalPassed += result.passed;
-					}
-					applyTestResultToMeta(meta, result);
-				} catch {
-					// Ignore individual model errors
-				}
-
-				completed++;
-				this.state.testProgress = { current: completed, total: allTasks.length };
-			}
-		}
-
-		try {
-			const workerCount = Math.max(1, Math.min(Math.floor(concurrency), allTasks.length));
-			await Promise.all(Array.from({ length: workerCount }, () => workerFn.call(this)));
-
-			if (signal.aborted || this.isClosed) {
-				return;
-			}
-
-			writeConfig(this.config);
+			};
+			const count = Math.max(1, Math.min(this.config.settings.testConcurrency ?? DEFAULT_TEST_CONCURRENCY, tasks.length));
+			await Promise.all(Array.from({ length: count }, worker));
+			if (!this.taskIsCurrent(controller)) return;
 			this.loadModels();
-			this.ctx.ui.notify(`Tested ${totalTested} model(s) across all gateways: ${totalPassed} prompt(s) passed`, "info");
-		} finally {
-			this.ctx.ui.setStatus("ai-manager", undefined);
-			if (this.activeAbortController === abortController) {
-				this.activeAbortController = null;
-			}
-		}
+			this.ctx.ui.notify(`Tested ${completed} models. Enter saves the measurements.`, "info");
+		});
 	}
 
 	// ---- add / delete provider ----
 
-	private openAddForm(): void {
+	private openAddForm(editing = false): void {
+		const name = editing ? this.state.selectedGateway : undefined;
+		const entry = name ? this.config.providers[name] : undefined;
+		if (editing && !entry) return;
+		const fields: AddProviderForm["fields"] = [new TextInput(), new TextInput(), new TextInput(true)];
+		if (entry && name) {
+			fields[0].value = name;
+			fields[1].value = entry.baseUrl;
+			fields[2].value = entry.apiKeyEnv ? `env:${entry.apiKeyEnv}` : entry.apiKey ?? "";
+		}
 		this.form = {
-			fields: [new TextInput(), new TextInput(), new TextInput(true)],
-			fieldIndex: 0,
-			apiIndex: DEFAULT_API_INDEX,
-			detectState: "idle",
-			status: "",
-			statusKind: "info",
+			fields, fieldIndex: editing ? 1 : 0, editingName: name,
+			apiIndex: entry ? API_CHOICES.indexOf(entry.defaultApi) : DEFAULT_API_INDEX,
+			detectState: "idle", status: "Key: literal or env:VARIABLE; blank uses /login. Ctrl+U clears a field.", statusKind: "info",
 		};
+		this.formOffset = 0;
 		this.state.mode = "form";
 	}
 
-	/**
-	 * Probe /v1/models once when the API field is first reached. Doubles as the
-	 * reachability check: a failure is a warning, not a blocker.
-	 */
+	private formEntry(f: AddProviderForm): { name: string; entry: RelayProviderEntry } {
+		const name = f.editingName ?? f.fields[0].value.trim();
+		const nameError = validateName(name);
+		if (nameError) throw new Error(nameError);
+		if (!f.editingName && (this.config.providers[name] || this.ctx.modelRegistry.getProvider?.(name))) {
+			throw new Error(`Provider ${name} already exists. Use E to edit a gateway managed here.`);
+		}
+		const old = f.editingName ? this.config.providers[name] : undefined;
+		const baseUrl = canonicalBaseUrl(f.fields[1].value, old?.allowInsecureHttp);
+		if (!baseUrl) throw new Error("Use a valid HTTPS URL without credentials, query or fragment. HTTP is allowed for loopback.");
+		const rawKey = f.fields[2].value.trim();
+		const apiKeyEnv = rawKey.startsWith("env:") ? rawKey.slice(4) : undefined;
+		if (apiKeyEnv !== undefined && !isEnvName(apiKeyEnv)) throw new Error("Use env:VARIABLE_NAME for an environment credential.");
+		const entry: RelayProviderEntry = old ? JSON.parse(JSON.stringify(old)) : {
+			baseUrl, defaultApi: API_CHOICES[f.apiIndex], models: Object.create(null), enabledModels: [],
+		};
+		entry.baseUrl = baseUrl;
+		entry.defaultApi = API_CHOICES[f.apiIndex];
+		delete entry.apiKey;
+		delete entry.apiKeyEnv;
+		if (apiKeyEnv) entry.apiKeyEnv = apiKeyEnv;
+		else if (rawKey) entry.apiKey = rawKey;
+		if (old && (old.baseUrl !== baseUrl || old.apiKey !== entry.apiKey || old.apiKeyEnv !== entry.apiKeyEnv)) {
+			for (const meta of Object.values(entry.models)) { delete meta.health; delete meta.metrics; }
+		}
+		return { name, entry };
+	}
+
 	private async detectApiForForm(): Promise<void> {
 		const f = this.form;
 		if (!f || f.detectState !== "idle") return;
-		const baseUrl = canonicalBaseUrl(f.fields[1].value);
-		if (!baseUrl) return;
-
-		f.detectState = "detecting";
-		f.status = "detecting API from /v1/models…";
-		f.statusKind = "info";
-		this.busy = true;
-		const abortController = new AbortController();
-		this.activeAbortController = abortController;
-		try {
-			const key = f.fields[2].value || undefined;
-			const list = await fetchModelList(baseUrl, key);
-			if (abortController.signal.aborted || !this.form) return;
-			f.discovered = list;
-			const detected = detectDefaultApi(list);
-			if (detected === "ambiguous") {
-				f.apiIndex = DEFAULT_API_INDEX;
-				f.status = `no consistent API family across ${list.length} models — choose manually`;
+		let validated: { name: string; entry: RelayProviderEntry };
+		try { validated = this.formEntry(f); }
+		catch (error) { f.status = safeError(error); f.statusKind = "error"; return; }
+		await this.runTask(async controller => {
+			this.busy = true;
+			f.detectState = "detecting";
+			f.status = "Discovering models… Esc cancels.";
+			try {
+				const key = await providerApiKey(this.ctx, validated.name, validated.entry);
+				if (!this.taskIsCurrent(controller) || this.form !== f) return;
+				const list = await fetchModelList(validated.entry.baseUrl, key, { signal: controller.signal, allowInsecureHttp: validated.entry.allowInsecureHttp });
+				if (!this.taskIsCurrent(controller) || this.form !== f) return;
+				f.discovered = list;
+				const detected = detectDefaultApi(list);
+				if (detected !== "ambiguous" && !f.editingName) f.apiIndex = API_CHOICES.indexOf(detected);
+				f.status = detected === "ambiguous" ? `Found ${list.length} models. Choose the API manually.` : `Found ${list.length} models (${detected}).`;
+				f.statusKind = detected === "ambiguous" ? "warning" : "info";
+			} catch (error) {
+				if (!this.taskIsCurrent(controller) || this.form !== f) return;
+				f.discovered = [];
+				f.status = `Discovery unavailable: ${safeError(error, [validated.entry.apiKey ?? ""])}. You can still apply the form.`;
 				f.statusKind = "warning";
-			} else {
-				f.apiIndex = API_CHOICES.indexOf(detected);
-				f.status = `auto-detected ${detected} from ${list.length} models`;
+			} finally {
+				if (this.taskIsCurrent(controller) && this.form === f) f.detectState = "done";
 			}
-		} catch (error) {
-			if (abortController.signal.aborted || !this.form) return;
-			f.apiIndex = DEFAULT_API_INDEX;
-			f.status = `gateway not reachable (${error instanceof Error ? error.message : String(error)}) — will still save`;
-			f.statusKind = "warning";
-		} finally {
-			if (this.form) {
-				f.detectState = "done";
-			}
-			this.busy = false;
-			if (this.activeAbortController === abortController) {
-				this.activeAbortController = null;
-			}
-		}
+		});
 	}
 
 	private async submitForm(): Promise<void> {
 		const f = this.form;
 		if (!f) return;
-
-		const name = f.fields[0].value.trim();
-		const nameError = validateName(name);
-		if (nameError) {
-			f.status = nameError;
-			f.statusKind = "error";
-			f.fieldIndex = 0;
-			return;
-		}
-		if (this.config.providers[name]) {
-			f.status = `Provider "${name}" already exists.`;
-			f.statusKind = "error";
-			f.fieldIndex = 0;
-			return;
-		}
-		const baseUrl = canonicalBaseUrl(f.fields[1].value);
-		if (!baseUrl) {
-			f.status = "Invalid Base URL. Use an http(s) URL without credentials, query, or fragment.";
-			f.statusKind = "error";
-			f.fieldIndex = 1;
-			return;
-		}
-		const apiKey = f.fields[2].value;
-
-		const entry: RelayProviderEntry = {
-			baseUrl,
-			defaultApi: API_CHOICES[f.apiIndex],
-			...(apiKey ? { apiKey } : {}),
-			models: {},
-			enabledModels: [],
-		};
-
-		// Reuse the probe from detectApiForForm when possible; otherwise try
-		// once more so a reachable gateway comes pre-populated.
-		let discovered = f.discovered;
-		if (!discovered) {
+		let validated: { name: string; entry: RelayProviderEntry };
+		try { validated = this.formEntry(f); }
+		catch (error) { f.status = safeError(error); f.statusKind = "error"; return; }
+		await this.runTask(async controller => {
 			this.busy = true;
-			f.status = "fetching models…";
-			const abortController = new AbortController();
-			this.activeAbortController = abortController;
-			try {
-				discovered = await fetchModelList(baseUrl, apiKey || undefined);
-			} catch {
-				discovered = [];
-			} finally {
-				this.busy = false;
-				if (this.activeAbortController === abortController) {
-					this.activeAbortController = null;
+			const { name, entry } = validated;
+			let discovered = f.discovered;
+			if (discovered === undefined) {
+				try {
+					const key = await providerApiKey(this.ctx, name, entry);
+					if (!this.taskIsCurrent(controller) || this.form !== f) return;
+					discovered = await fetchModelList(entry.baseUrl, key, { signal: controller.signal, allowInsecureHttp: entry.allowInsecureHttp });
+				} catch (error) {
+					if (!this.taskIsCurrent(controller) || this.form !== f) return;
+					discovered = [];
+					this.ctx.ui.notify(`Discovery unavailable: ${safeError(error, [entry.apiKey ?? ""])}`, "warning");
 				}
 			}
-		}
-		const counts = applyDiscovery(entry, discovered);
-
-		// Auto-enable recommended models so they show up in pi immediately
-		// (Ctrl+P cycling, scoped-models). The user can refine later in the UI.
-		const allModelIds = Object.keys(entry.models);
-		const recommended = allModelIds.filter(id => {
-			const quality = scoreModel(id);
-			return quality.recommendScore >= 60 && !quality.isGarbage;
+			if (!this.taskIsCurrent(controller) || this.form !== f) return;
+			applyDiscovery(entry, discovered);
+			const before = this.config.providers[name] ? JSON.parse(JSON.stringify(this.config.providers[name])) as RelayProviderEntry : undefined;
+			this.operationHistory.record({ gateway: name, description: `${before ? "Edit" : "Add"} provider ${name}`, undo: () => {
+				if (before) this.config.providers[name] = JSON.parse(JSON.stringify(before));
+				else delete this.config.providers[name];
+				this.state.selectedGateway = Object.keys(this.config.providers)[0] ?? "";
+			} });
+			this.config.providers[name] = entry;
+			if (before && (before.baseUrl !== entry.baseUrl || before.apiKey !== entry.apiKey || before.apiKeyEnv !== entry.apiKeyEnv)) {
+				for (const id of Object.keys(before.models)) this.sessionResults.delete(this.testKey(name, id));
+			}
+			this.state.selectedGateway = name;
+			this.state.activePane = "models";
+			this.loadModels();
+			this.form = null;
+			this.state.mode = "browse";
+			this.ctx.ui.notify(`Provider ${name} ${before ? "updated" : "added"} to draft. Select models, then Enter to save.`, "info");
 		});
-		entry.enabledModels = recommended;
-
-		this.config.providers[name] = entry;
-		this.state.selectedGateway = name;
-		this.state.activePane = "models";
-		this.state.selectedModelIndex = 0;
-		this.state.scrollOffset = 0;
-		this.state.gatewayScrollOffset = 0;
-		// Synchronous: syncScopedModels below writes settings.json immediately, so
-		// a debounced provider-ai.json write could leave the two files disagreeing.
-		writeConfigSync(this.config);
-		registerProviderFor(this.pi, name, entry);
-		syncScopedModels(name, entry);
-		this.loadModels();
-
-		this.form = null;
-		this.state.mode = "browse";
-		this.ctx.ui.notify(
-			`Provider "${name}" added${counts.added > 0 ? ` (${counts.added} models discovered)` : ""}. Run /login ${name} or store a key if auth fails.`,
-			"info",
-		);
 	}
 
 	private deleteProvider(name: string): void {
 		const entry = this.config.providers[name];
 		if (!entry) return;
-
-		const clearedScope = { ...entry, enabledModels: [] };
-		this.pi.unregisterProvider(name);
+		const before = JSON.parse(JSON.stringify(entry)) as RelayProviderEntry;
+		this.operationHistory.record({ gateway: name, description: `Delete provider ${name}`, undo: () => {
+			this.config.providers[name] = JSON.parse(JSON.stringify(before));
+			this.state.selectedGateway = name;
+		} });
 		delete this.config.providers[name];
-		this.initialEnabled.delete(name);
-		this.initialProvidersState.delete(name);
-		// provider-ai.json first, then settings.json. A crash between the two must
-		// leave the deleted gateway out of both files, never stranded in one. The
-		// entry is captured above because computeScopedPatterns cannot clean up
-		// patterns once the enabled list is gone from the config.
-		writeConfigSync(this.config);
-		syncScopedModels(name, clearedScope);
-
-		const gateways = Object.keys(this.config.providers);
-		this.state.selectedGateway = this.state.selectedGateway === name ? (gateways[0] ?? "") : this.state.selectedGateway;
-		this.state.selectedModelIndex = 0;
-		this.state.scrollOffset = 0;
+		this.state.selectedGateway = Object.keys(this.config.providers)[0] ?? "";
 		this.loadModels();
-		this.ctx.ui.notify(`Provider "${name}" removed. Credentials are not removed; run /logout separately.`, "info");
+		this.ctx.ui.notify(`Provider ${name} removed from draft. Enter saves; u restores it.`, "info");
 	}
 
 	// ---- input handler ----
 
-	async handleInput(data: string): Promise<boolean> {
-		// Help exits on any key and must not leak into browse actions.
-		if (this.state.mode === "help") {
-			this.state.mode = "browse";
+	private openMenu(kind: MenuState["kind"]): void {
+		this.menu = { kind, input: new TextInput(), index: 0, offset: 0 };
+		this.state.mode = "menu";
+	}
+
+	private movePanel(data: string): boolean {
+		const offset = this.state.mode === "help" ? this.helpOffset : this.panelOffset;
+		let next = offset;
+		if (matchesKey(data, Key.up)) next--;
+		else if (matchesKey(data, Key.down)) next++;
+		else if (matchesKey(data, Key.pageUp)) next -= this.panelRows;
+		else if (matchesKey(data, Key.pageDown)) next += this.panelRows;
+		else if (matchesKey(data, Key.home)) next = 0;
+		else if (matchesKey(data, Key.end)) next = this.panelLength;
+		else return false;
+		next = Math.max(0, Math.min(next, this.panelLength - this.panelRows));
+		if (this.state.mode === "help") this.helpOffset = next;
+		else this.panelOffset = next;
+		return true;
+	}
+
+	private async handleMenuInput(data: string): Promise<boolean> {
+		const menu = this.menu!;
+		const items = this.menuItems();
+		if (matchesKey(data, Key.escape)) { this.menu = null; this.state.mode = "browse"; return true; }
+		if (matchesKey(data, Key.up) || matchesKey(data, Key.down) || matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown)) {
+			const step = matchesKey(data, Key.up) ? -1 : matchesKey(data, Key.down) ? 1 : matchesKey(data, Key.pageUp) ? -this.menuRows : this.menuRows;
+			menu.index = Math.max(0, Math.min(items.length - 1, menu.index + step));
 			return true;
 		}
-
-		// A network probe from the form is in flight; swallow everything except escape
-		if (this.busy) {
-			if (matchesKey(data, Key.escape)) {
-				this.abortActiveTasks();
-				this.busy = false;
-				if (this.state.mode === "form") {
-					this.form = null;
-					this.state.mode = "browse";
-				}
+		if (matchesKey(data, Key.enter)) {
+			const selected = items[menu.index];
+			if (!selected?.enabled) return true;
+			this.menu = null;
+			this.state.mode = "browse";
+			if (menu.kind === "filters") {
+				if (selected.id === "reset") {
+					this.state.filterMode = "all";
+					this.state.qualityFilter = "all";
+					this.filterInput.clear();
+				} else if (selected.id.startsWith("filter:")) this.state.filterMode = selected.id.slice(7) as FilterMode;
+				else if (selected.id.startsWith("quality:")) this.state.qualityFilter = selected.id.slice(8) as QualityFilter;
+				this.state.activePane = "models";
+				this.applyFiltersAndSort();
 				return true;
 			}
-			return true;
+			return this.executeCommand(selected.id as CommandId);
 		}
+		if (menu.input.handleInput(data) === "typed") { menu.index = 0; menu.offset = 0; }
+		return true;
+	}
 
-		if (this.state.testingInProgress) {
-			if (matchesKey(data, Key.escape)) {
-				this.abortActiveTasks();
-				this.isClosed = true;
-				this.cancel();
-				this.saved = false;
-				return false;
+	async handleInput(data: string): Promise<boolean> {
+		if (this.isClosed) return false;
+		if (isKeyRelease(data)) return true;
+		const deletePrefix = matchesKey(data, "d");
+		if (!deletePrefix && this.lastKey === "d") {
+			this.lastKey = "";
+			this.notice = "";
+		}
+		// A separate stop command works even while a panel, search or form has focus.
+		if (matchesKey(data, Key.ctrl("c")) && this.activeAbortController) {
+			this.stopTask();
+			if (this.form) {
+				this.form.detectState = "idle";
+				this.form.status = "发现已停止，表单已保留；Enter 可重试。";
+				this.form.statusKind = "info";
 			}
 			return true;
 		}
-
+		if (this.busy) {
+			if (matchesKey(data, Key.escape)) {
+				this.stopTask();
+				this.form = null;
+				this.state.mode = "browse";
+			}
+			return true;
+		}
+		if (["help", "details", "changes", "compare"].includes(this.state.mode)) {
+			if (this.movePanel(data)) return true;
+			if (this.state.mode === "details" && this.state.activePane === "models") {
+				const command = commandForInput(data, "models");
+				if (command && MODEL_SETTING_COMMANDS.some(id => command.id === id)) {
+					const blocked = this.commandBlocked(command);
+					if (blocked) this.ctx.ui.notify(blocked, "warning");
+					else return this.executeCommand(command.id);
+					return true;
+				}
+			}
+			if (matchesKey(data, Key.escape) || (matchesKey(data, "i") && this.state.mode === "details") ||
+				(matchesKey(data, "v") && this.state.mode === "changes") || (matchesKey(data, "?") && this.state.mode === "help")) this.state.mode = "browse";
+			else if (matchesKey(data, ":")) this.openMenu("actions");
+			return true;
+		}
+		if (this.pendingTest) {
+			const pending = this.pendingTest;
+			if (this.movePanel(data)) return true;
+			if (matchesKey(data, Key.escape)) this.pendingTest = null;
+			else if (matchesKey(data, Key.enter)) {
+				this.pendingTest = null;
+				if (pending.allGateways) await this.testAllGateways();
+				else await this.testModels(pending.ids ?? [], pending.gateway);
+			}
+			return true;
+		}
+		if (this.menu) return this.handleMenuInput(data);
 		if (this.state.mode === "form" && this.form) return this.handleFormInput(data);
 		if (this.state.mode === "context" && this.contextForm) return this.handleContextInput(data);
 		if (this.state.mode === "pattern" && this.pattern) return this.handlePatternInput(data);
-		if (this.confirmDelete) return this.handleConfirmInput(data);
-
-		// ---- browse mode ----
+		if (this.confirmDelete) return this.movePanel(data) || this.handleConfirmInput(data);
 
 		if (this.state.isFiltering) {
 			const action = this.filterInput.handleInput(data);
 			if (action === "cancel") {
-				this.filterInput.clear();
+				this.filterInput.value = this.searchBefore;
 				this.state.isFiltering = false;
-			} else if (action === "submit") {
-				this.state.isFiltering = false;
-			}
-			this.applyFiltersAndSort();
+				if (this.searchSelection) {
+					this.state.selectedModelIndex = this.searchSelection.index;
+					this.state.scrollOffset = this.searchSelection.scroll;
+				}
+				this.applyFiltersAndSort(this.searchSelection?.modelId);
+			} else if (action === "submit") this.state.isFiltering = false;
+			else if (action === "typed") this.applyFiltersAndSort();
 			return true;
 		}
 
-		// Navigation
-		if (matchesKey(data, Key.up)) {
+		if (matchesKey(data, Key.left) || matchesKey(data, Key.right) || matchesKey(data, Key.tab) || matchesKey(data, Key.shift("tab"))) {
+			this.state.activePane = matchesKey(data, Key.left) ? "gateways" : matchesKey(data, Key.right) ? "models"
+				: this.state.activePane === "models" ? "gateways" : "models";
+			return true;
+		}
+		if ([Key.up, Key.down, Key.pageUp, Key.pageDown, Key.home, Key.end].some(key => matchesKey(data, key))) {
+			const count = this.state.activePane === "models" ? this.state.filteredRows.length : Object.keys(this.config.providers).length;
+			const current = this.state.activePane === "models" ? this.state.selectedModelIndex : Object.keys(this.config.providers).indexOf(this.state.selectedGateway);
+			const next = matchesKey(data, Key.home) ? 0 : matchesKey(data, Key.end) ? count - 1
+				: current + (matchesKey(data, Key.up) ? -1 : matchesKey(data, Key.down) ? 1 : matchesKey(data, Key.pageUp) ? -this.visibleRows : this.visibleRows);
 			if (this.state.activePane === "models") {
-				this.state.selectedModelIndex = Math.max(0, this.state.selectedModelIndex - 1);
+				this.state.selectedModelIndex = Math.max(0, Math.min(count - 1, next));
+				this.clampScroll();
+				this.rememberModelView();
+			} else this.selectGateway(next - current);
+			return true;
+		}
+
+		if (deletePrefix && this.state.activePane === "gateways" && this.state.selectedGateway) {
+			if (this.activeAbortController) { this.notice = "任务进行中，请先停止"; return true; }
+			if (this.lastKey === "d") {
+				this.confirmDelete = this.state.selectedGateway;
+				this.panelOffset = 0;
+				this.lastKey = "";
+				this.notice = "";
 			} else {
-				this.selectGateway(-1);
+				this.lastKey = "d";
+				this.notice = "再按 d 发起删除确认；其他键取消。";
 			}
 			return true;
 		}
+		const command = commandForInput(data, this.state.activePane);
+		if (!command) return true;
+		const blocked = this.commandBlocked(command);
+		if (blocked) { this.notice = blocked; return true; }
+		return this.executeCommand(command.id);
+	}
 
-		if (matchesKey(data, Key.down)) {
-			if (this.state.activePane === "models") {
-				this.state.selectedModelIndex = Math.min(
-					Math.max(0, this.state.filteredRows.length - 1),
-					this.state.selectedModelIndex + 1,
-				);
-			} else {
-				this.selectGateway(1);
-			}
-			return true;
-		}
-
-		if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown)) {
-			const direction = matchesKey(data, Key.pageUp) ? -1 : 1;
-			if (this.state.activePane === "models") {
-				this.state.selectedModelIndex = Math.max(
-					0,
-					Math.min(
-						Math.max(0, this.state.filteredRows.length - 1),
-						this.state.selectedModelIndex + direction * this.visibleRows,
-					),
-				);
-			} else {
-				this.selectGateway(direction * this.visibleRows);
-			}
-			return true;
-		}
-
-		if (matchesKey(data, Key.left)) {
-			this.state.activePane = "gateways";
-			return true;
-		}
-
-		if (matchesKey(data, Key.right) || matchesKey(data, Key.tab)) {
-			this.state.activePane = "models";
-			return true;
-		}
-
-		// Space: toggle model
-		if (matchesKey(data, Key.space) && this.state.activePane === "models") {
-			const row = this.state.filteredRows[this.state.selectedModelIndex];
-			const entry = this.config.providers[this.state.selectedGateway];
-			if (row && entry) {
-				const previousState = [...entry.enabledModels];
+	private async executeCommand(id: CommandId): Promise<boolean> {
+		const row = this.state.filteredRows[this.state.selectedModelIndex];
+		const entry = this.config.providers[this.state.selectedGateway];
+		switch (id) {
+			case "toggle": {
+				if (!row || !entry) break;
+				const before = [...entry.enabledModels];
 				row.enabled = !row.enabled;
-				const enabledSet = new Set(entry.enabledModels);
-				if (row.enabled) {
-					if (!enabledSet.has(row.id)) entry.enabledModels.push(row.id);
-				} else {
-					entry.enabledModels = entry.enabledModels.filter(id => id !== row.id);
-				}
-				this.recordOperation(
-					"toggle-model",
-					this.state.selectedGateway,
-					`${row.enabled ? "Enabled" : "Disabled"} model ${row.id}`,
-					previousState,
-					entry.enabledModels,
-				);
+				entry.enabledModels = row.enabled ? [...new Set([...entry.enabledModels, row.id])] : entry.enabledModels.filter(modelId => modelId !== row.id);
+				this.recordOperation("toggle-model", this.state.selectedGateway, (row.enabled ? "Enabled " : "Disabled ") + row.id, before, entry.enabledModels);
+				this.draftCache = null;
+				this.applyFiltersAndSort();
+				break;
 			}
-			return true;
-		}
-
-		// t: test selected model
-		if (data === "t" && this.state.activePane === "models") {
-			const row = this.state.filteredRows[this.state.selectedModelIndex];
-			if (row) await this.testModels([row.id]);
-			return true;
-		}
-
-		// T: test all visible models
-		if (data === "T") {
-			const modelIds = this.state.filteredRows.map(r => r.id);
-			if (modelIds.length > 0) await this.testModels(modelIds);
-			return true;
-		}
-
-		// /: filter
-		if (data === "/") {
-			this.state.isFiltering = true;
-			return true;
-		}
-
-		// s: cycle sort mode
-		if (data === "s") {
-			const modes: SortMode[] = ["name", "status", "performance", "enabled"];
-			const currentIndex = modes.indexOf(this.state.sortMode);
-			this.state.sortMode = modes[(currentIndex + 1) % modes.length];
-			this.applyFiltersAndSort();
-			return true;
-		}
-
-		// q: cycle quality filter
-		if (data === "q") {
-			const modes: QualityFilter[] = ["all", "recommended", "strict"];
-			const currentIndex = modes.indexOf(this.state.qualityFilter);
-			this.state.qualityFilter = modes[(currentIndex + 1) % modes.length];
-			this.applyFiltersAndSort();
-			return true;
-		}
-
-		// r: refresh (re-discover)
-		if (data === "r") {
-			await this.refreshModels();
-			return true;
-		}
-
-		// a: auto-select recommended models
-		if (data === "a") {
-			await this.autoSelectModels();
-			return true;
-		}
-
-		// u: undo last operation
-		if (data === "u") {
-			this.undoLastOperation();
-			return true;
-		}
-
-		// d / dd: dedup (models pane) or delete gateway (gateways pane, vim-style dd)
-		if (data === "d") {
-			if (this.state.activePane === "gateways" && this.state.selectedGateway) {
-				if (this.lastKey === "d") {
-					// Second d → delete provider
-					this.confirmDelete = this.state.selectedGateway;
-					this.lastKey = "";
-				} else {
-					this.lastKey = "d";
-				}
-				return true;
+			case "test":
+				if (row) await this.testModels([row.id]);
+				break;
+			case "test-visible": {
+				const ids = this.state.filteredRows.map(row => row.id);
+				if (ids.length) this.pendingTest = { gateway: this.state.selectedGateway, ids, allGateways: false, count: ids.length };
+				else this.notice = "没有匹配的模型可测试";
+				this.panelOffset = 0;
+				break;
 			}
-			await this.dedupModels();
-			this.lastKey = "";
-			return true;
+			case "test-all": {
+				const count = Object.values(this.config.providers).reduce((sum, entry) => sum + entry.enabledModels.filter(id => Object.hasOwn(entry.models, id)).length, 0);
+				if (count) this.pendingTest = { allGateways: true, count };
+				else this.notice = "没有已启用模型可测试";
+				this.panelOffset = 0;
+				break;
+			}
+			case "search":
+				this.searchBefore = this.filterInput.value;
+				this.searchSelection = { modelId: row?.id, index: this.state.selectedModelIndex, scroll: this.state.scrollOffset };
+				this.state.isFiltering = true;
+				this.state.activePane = "models";
+				break;
+			case "sort": {
+				const modes: SortMode[] = ["name", "status", "performance", "enabled"];
+				this.state.sortMode = modes[(modes.indexOf(this.state.sortMode) + 1) % modes.length];
+				this.applyFiltersAndSort();
+				break;
+			}
+			case "quality": {
+				const modes: QualityFilter[] = ["all", "recommended", "strict"];
+				this.state.qualityFilter = modes[(modes.indexOf(this.state.qualityFilter) + 1) % modes.length];
+				this.applyFiltersAndSort();
+				break;
+			}
+			case "refresh": await this.refreshModels(); break;
+			case "refresh-all": await this.refreshAllGateways(); break;
+			case "auto": await this.autoSelectModels(); break;
+			case "dedup": await this.dedupModels(); break;
+			case "undo": this.undoLastOperation(); break;
+			case "context": this.openContextWindowForm(); break;
+			case "compare": this.compareModel(); break;
+			case "protocol": this.cycleModelApi(); break;
+			case "reasoning": this.toggleModelReasoning(); break;
+			case "enable-pattern":
+			case "disable-pattern":
+				this.pattern = { kind: id === "enable-pattern" ? "enable" : "disable", input: new TextInput() };
+				this.state.mode = "pattern";
+				break;
+			case "add": this.openAddForm(); break;
+			case "edit": this.openAddForm(true); break;
+			case "delete":
+				this.confirmDelete = this.state.selectedGateway;
+				this.panelOffset = 0;
+				break;
+			case "actions": this.openMenu("actions"); break;
+			case "filters": this.openMenu("filters"); break;
+			case "help":
+			case "details":
+			case "changes":
+				this.state.mode = id;
+				this.helpOffset = 0;
+				this.panelOffset = 0;
+				break;
+			case "stop": this.stopTask(); break;
+			case "save":
+				this.abortActiveTasks();
+				if (!this.save()) return true;
+				this.isClosed = true;
+				this.saved = true;
+				return false;
+			case "discard":
+				if (this.activeAbortController) { this.stopTask(); return true; }
+				this.cancel();
+				this.isClosed = true;
+				this.saved = false;
+				return false;
 		}
-
-		// C: manually configure the selected model's context window
-		if (data === "C" && this.state.activePane === "models") {
-			this.openContextWindowForm();
-			return true;
-		}
-
-		// c: compare model across gateways
-		if (data === "c" && this.state.activePane === "models") {
-			await this.compareModel();
-			return true;
-		}
-
-		// p: cycle the selected model's API (endpoint protocol)
-		if (data === "p" && this.state.activePane === "models") {
-			this.cycleModelApi();
-			return true;
-		}
-
-		// g / b: toggle thinking / reasoning
-		if ((data === "g" || data === "b") && this.state.activePane === "models") {
-			this.toggleModelReasoning();
-			return true;
-		}
-
-		// e/x: enable/disable by pattern (typed in-component)
-		if (data === "e" || data === "x") {
-			if (!this.state.selectedGateway) return true;
-			this.pattern = { kind: data === "e" ? "enable" : "disable", input: new TextInput() };
-			this.state.mode = "pattern";
-			return true;
-		}
-
-		// R: refresh all gateways
-		if (data === "R") {
-			await this.refreshAllGateways();
-			return true;
-		}
-
-		// A: test all gateways
-		if (data === "A") {
-			await this.testAllGateways();
-			return true;
-		}
-
-		// n: add provider
-		if (data === "n") {
-			this.openAddForm();
-			return true;
-		}
-
-		// D: delete selected provider (immediate, with confirmation)
-		if (data === "D" && this.state.activePane === "gateways" && this.state.selectedGateway) {
-			this.confirmDelete = this.state.selectedGateway;
-			this.lastKey = "";
-			return true;
-		}
-		this.lastKey = data;
-
-		// ?: show help
-		if (data === "?") {
-			this.state.mode = "help";
-			return true;
-		}
-
-		// Enter: save and exit
-		if (matchesKey(data, Key.enter)) {
-			this.abortActiveTasks();
-			const saved = this.save();
-			if (!saved) return true;
-			this.isClosed = true;
-			this.saved = true;
-			return false;
-		}
-
-		// Escape: cancel without saving
-		if (matchesKey(data, Key.escape)) {
-			this.abortActiveTasks();
-			this.isClosed = true;
-			this.cancel();
-			this.saved = false;
-			return false;
-		}
-
 		return true;
 	}
 
-	private handleFormInput(data: string): boolean {
+	private async handleFormInput(data: string): Promise<boolean> {
 		const f = this.form;
 		if (!f) return true;
 
 		if (matchesKey(data, Key.escape)) {
 			this.form = null;
 			this.state.mode = "browse";
+			return true;
+		}
+		if (matchesKey(data, Key.shift("tab"))) {
+			f.fieldIndex = f.fieldIndex <= (f.editingName ? 1 : 0) ? 3 : f.fieldIndex - 1;
 			return true;
 		}
 
@@ -1746,8 +1476,12 @@ export class RelayManagerTUI {
 				f.fieldIndex = 2;
 				return true;
 			}
+			if (matchesKey(data, Key.tab) || matchesKey(data, Key.down)) {
+				f.fieldIndex = f.editingName ? 1 : 0;
+				return true;
+			}
 			if (matchesKey(data, Key.enter)) {
-				void this.submitForm();
+				await this.submitForm();
 				return true;
 			}
 			return true;
@@ -1756,25 +1490,32 @@ export class RelayManagerTUI {
 		// Text fields: Enter/↓/Tab advances, ↑ goes back.
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.tab) || matchesKey(data, Key.down)) {
 			f.fieldIndex = Math.min(3, f.fieldIndex + 1);
-			if (f.fieldIndex === 3) void this.detectApiForForm();
+			if (f.fieldIndex === 3) await this.detectApiForForm();
 			return true;
 		}
 		if (matchesKey(data, Key.up)) {
-			f.fieldIndex = Math.max(0, f.fieldIndex - 1);
+			f.fieldIndex = Math.max(f.editingName ? 1 : 0, f.fieldIndex - 1);
 			return true;
 		}
-		f.fields[f.fieldIndex].handleInput(data);
+		if (f.editingName && f.fieldIndex === 0) return true;
+		const field = f.fields[f.fieldIndex];
+		const previous = field.value;
+		field.handleInput(data);
+		if (field.value !== previous) {
+			f.discovered = undefined;
+			f.detectState = "idle";
+		}
 		return true;
 	}
 
 	private openContextWindowForm(): void {
 		const row = this.state.filteredRows[this.state.selectedModelIndex];
 		if (!row) return;
-		const current = row.meta.contextWindow;
 		this.contextForm = {
 			modelId: row.id,
 			input: new TextInput(),
-			status: current ? `Current value: ${current} tokens` : "",
+			status: "",
+			returnMode: this.state.mode === "details" ? "details" : "browse",
 		};
 		this.state.mode = "context";
 	}
@@ -1785,7 +1526,7 @@ export class RelayManagerTUI {
 		const action = f.input.handleInput(data);
 		if (action === "cancel") {
 			this.contextForm = null;
-			this.state.mode = "browse";
+			this.state.mode = f.returnMode;
 			return true;
 		}
 		if (action !== "submit") return true;
@@ -1798,6 +1539,7 @@ export class RelayManagerTUI {
 			return true;
 		}
 		const raw = f.input.value.trim();
+		const previous = meta.contextWindow;
 		if (!raw) {
 			meta.contextWindow = undefined;
 		} else {
@@ -1808,11 +1550,13 @@ export class RelayManagerTUI {
 			}
 			meta.contextWindow = parsed;
 		}
-		writeConfig(this.config);
-		registerProviderFor(this.pi, this.state.selectedGateway, entry);
+		const next = meta.contextWindow;
+		meta.contextWindow = previous;
+		this.recordModelEdit(this.state.selectedGateway, f.modelId, `Set context window for ${f.modelId}`, ["contextWindow"]);
+		meta.contextWindow = next;
 		this.loadModels();
 		this.contextForm = null;
-		this.state.mode = "browse";
+		this.state.mode = f.returnMode;
 		this.ctx.ui.notify(
 			meta.contextWindow ? `Context window for "${f.modelId}" set to ${meta.contextWindow} tokens` : `Context window override cleared for "${f.modelId}"`,
 			"info",
@@ -1836,7 +1580,7 @@ export class RelayManagerTUI {
 	}
 
 	private handleConfirmInput(data: string): boolean {
-		if (data === "D" || data === "d" || matchesKey(data, Key.enter)) {
+		if (matchesKey(data, Key.shift("d")) || matchesKey(data, "d") || matchesKey(data, Key.enter)) {
 			const name = this.confirmDelete;
 			this.confirmDelete = null;
 			if (name) this.deleteProvider(name);
@@ -1900,30 +1644,29 @@ export class RelayManagerTUI {
 			this.ctx.ui.notify("ai-manager requires TUI mode", "error");
 			return false;
 		}
-
-		let result: boolean | undefined;
 		try {
-			result = await this.ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
+			return await this.ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
+				this.requestRender = () => { if (!this.isClosed) tui.requestRender(); };
 				return {
-					render: (width: number) => this.render(width, terminalHeight(), theme),
+					render: (width: number) => this.render(width, tui.terminal?.rows ?? terminalHeight(), theme),
 					invalidate: () => {},
-					handleInput: async (data: string) => {
-						const shouldContinue = await this.handleInput(data);
-						if (!shouldContinue) {
-							// Report what actually happened; Esc must not claim a save.
-							done(this.saved);
-						} else {
-							tui.requestRender();
-						}
+					handleInput: (data: string) => {
+						if (this.isClosed) return;
+						void this.handleInput(data).then(shouldContinue => {
+							if (!shouldContinue) done(this.saved);
+							else this.requestRender();
+						}).catch(error => {
+							this.reportError(error);
+							this.requestRender();
+						});
 					},
 				};
-			});
+			}, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0, anchor: "center" } }) ?? false;
 		} finally {
-			// Durability net: save()/cancel() already write synchronously, but any path
-			// that leaves without one (an early throw, a mode guard) must not drop a
-			// debounced writeConfig that is still sitting in the 500ms timer.
-			flushConfig();
+			this.isClosed = true;
+			this.abortActiveTasks();
+			this.ctx.ui.setStatus("ai-manager", undefined);
+			this.requestRender = () => {};
 		}
-		return result ?? false;
 	}
 }

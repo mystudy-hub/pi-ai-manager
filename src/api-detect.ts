@@ -22,7 +22,7 @@ export function detectDefaultApi(models: readonly DiscoveredModel[]): RelayApi |
 	for (const model of models) {
 		if (model.types.length === 0) return "ambiguous";
 		for (const type of model.types) {
-			const apis = ENDPOINT_TYPE_TO_APIS[type] ?? [];
+			const apis = Object.hasOwn(ENDPOINT_TYPE_TO_APIS, type) ? ENDPOINT_TYPE_TO_APIS[type] : [];
 			if (apis.includes("anthropic-messages")) sawAnthropic = true;
 			if (apis.includes("openai-completions") || apis.includes("openai-responses")) sawOpenai = true;
 		}

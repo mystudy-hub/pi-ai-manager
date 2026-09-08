@@ -21,8 +21,12 @@ export interface HealthStatus {
 
 export interface RelayModelMeta {
 	api: RelayApi;
+	/** Protocol learned from discovery before manual overrides are applied. */
+	discoveredApi?: RelayApi;
 	contextWindow?: number;
 	maxTokens?: number;
+	/** Prices per million tokens. Missing prices are unknown, not free. */
+	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	reasoning?: boolean;
 	thinkingLevelMap?: Record<string, string | null>;
 	thinkingMode?: "auto" | "enabled" | "disabled";
@@ -43,6 +47,10 @@ export interface RelayProviderEntry {
 	 * pi falls back to the /login credential.
 	 */
 	apiKey?: string;
+	/** Explicit environment reference; apiKey itself is always a literal. */
+	apiKeyEnv?: string;
+	/** Opt-in for trusted LAN relays. Loopback HTTP needs no opt-in. */
+	allowInsecureHttp?: boolean;
 	defaultApi: RelayApi;
 	modelApiOverrides?: Record<string, RelayApi>;
 	models: Record<string, RelayModelMeta>;
@@ -114,8 +122,9 @@ export const ENDPOINT_TYPE_TO_APIS: Record<string, readonly RelayApi[]> = {
 	openai: ["openai-completions", "openai-responses"],
 };
 
-export const DEFAULT_CONTEXT_WINDOW = 256_000;
-export const DEFAULT_MAX_TOKENS = 32_768;
+/** Conservative compatibility defaults for models absent from Pi's catalogue. */
+export const DEFAULT_CONTEXT_WINDOW = 32_768;
+export const DEFAULT_MAX_TOKENS = 8_192;
 export const DISCOVERY_TIMEOUT_MS = 15_000;
 export const REACHABILITY_TIMEOUT_MS = 5_000;
 export const TEST_TIMEOUT_MS = 30_000;
@@ -126,6 +135,8 @@ export const TEST_QUESTIONS_PER_MODEL = 3;
 export const DEFAULT_TEST_CONCURRENCY = 3;
 export const DEFAULT_TEST_REQUEST_DELAY_MS = 500;
 export const MAX_RETRIES = 2;
+export const HEALTH_TTL_MS = 24 * 60 * 60 * 1000;
+export const MAX_TEST_CONCURRENCY = 10;
 
 export const DEFAULT_TEST_QUESTIONS: readonly string[] = [
 	"你好，请用一句话介绍一下你自己。",

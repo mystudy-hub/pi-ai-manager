@@ -1,3 +1,5 @@
+> 历史文档：当前保存方式、快捷键和验证命令已调整，请使用 [当前 README](../README.md)。
+
 # ✅ AI Gateway v3.1.1 验证清单
 
 ## 修复验证：writer.write is not a function

@@ -31,7 +31,18 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": ">=0.85.1 <0.86.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "~7.0.2"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
@@ -47,7 +58,8 @@
   },
   "homepage": "https://github.com/mystudy-hub/pi-ai-manager#readme",
   "scripts": {
-    "test": "node tests/test-config-write.js && node tests/test-reasoning.js && node tests/verify-integration.js && node tests/review-regression.cjs",
-    "typecheck": "tsc --noEmit"
+    "test": "node tests/test-reasoning.js && node tests/review-regression.cjs && node tests/tui-ux-regression.cjs && node tests/config-regression.cjs && node tests/security-regression.cjs && node tests/verify-integration.js",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
   }
 }

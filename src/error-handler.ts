@@ -2,7 +2,10 @@
 // Unified Error Handling and Recovery
 // ---------------------------------------------------------------------------
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { atomicWrite } from "./storage.ts";
+import { safeError } from "./security.ts";
 import { dirname, join } from "node:path";
 
 export type ErrorLevel = "fatal" | "recoverable" | "warning";
@@ -32,7 +35,7 @@ export class ErrorHandler {
 		const ctx: ErrorContext = {
 			level,
 			code,
-			message,
+			message: safeError(message),
 			timestamp: Date.now(),
 			metadata,
 			stack: new Error().stack,
@@ -47,13 +50,13 @@ export class ErrorHandler {
 		const prefix = `[ai-gateway:${level}:${code}]`;
 		switch (level) {
 			case "fatal":
-				console.error(prefix, message, metadata);
+				console.error(prefix, ctx.message);
 				break;
 			case "recoverable":
-				console.warn(prefix, message, metadata);
+				console.warn(prefix, ctx.message);
 				break;
 			case "warning":
-				console.log(prefix, message, metadata);
+				console.log(prefix, ctx.message);
 				break;
 		}
 
@@ -73,11 +76,7 @@ export class ErrorHandler {
 		try {
 			const dir = dirname(this.logPath);
 			mkdirSync(dir, { recursive: true });
-			writeFileSync(
-				this.logPath,
-				this.errorLog.map(e => JSON.stringify(e)).join("\n"),
-				"utf-8"
-			);
+			atomicWrite(this.logPath, this.errorLog.map(e => JSON.stringify(e)).join("\n"));
 		} catch (err) {
 			console.error("Failed to write error log:", err);
 		}
@@ -121,7 +120,7 @@ export class ConfigRecovery {
 
 	constructor(backupDir: string) {
 		this.backupDir = backupDir;
-		mkdirSync(backupDir, { recursive: true });
+		mkdirSync(backupDir, { recursive: true, mode: 0o700 });
 	}
 
 	/**
@@ -132,18 +131,14 @@ export class ConfigRecovery {
 
 		try {
 			const content = readFileSync(configPath, "utf-8");
+			JSON.parse(content);
 			const timestamp = Date.now();
 			const backupPath = join(
 				this.backupDir,
-				`provider-ai.backup.${timestamp}.json`
+				`provider-ai.backup.${timestamp}-${randomUUID()}.json`
 			);
 
-			writeFileSync(backupPath, content, { encoding: "utf-8", mode: 0o600 });
-			if (process.platform !== "win32") {
-				try {
-					require("node:fs").chmodSync(backupPath, 0o600);
-				} catch {}
-			}
+			atomicWrite(backupPath, content);
 
 			// Clean old backups
 			this.cleanOldBackups();
@@ -164,7 +159,7 @@ export class ConfigRecovery {
 	 */
 	listBackups(): ConfigBackup[] {
 		try {
-			const files = require("node:fs").readdirSync(this.backupDir);
+			const files = readdirSync(this.backupDir);
 			const backups: ConfigBackup[] = [];
 
 			for (const file of files) {
@@ -172,7 +167,7 @@ export class ConfigRecovery {
 					continue;
 				}
 
-				const match = file.match(/provider-ai\.backup\.(\d+)\.json/);
+				const match = file.match(/^provider-ai\.backup\.(\d+)(?:-[\w-]+)?\.json$/);
 				if (!match) continue;
 
 				const timestamp = parseInt(match[1], 10);
@@ -197,12 +192,7 @@ export class ConfigRecovery {
 	 */
 	restore(backup: ConfigBackup, targetPath: string): boolean {
 		try {
-			writeFileSync(targetPath, backup.content, { encoding: "utf-8", mode: 0o600 });
-			if (process.platform !== "win32") {
-				try {
-					require("node:fs").chmodSync(targetPath, 0o600);
-				} catch {}
-			}
+			atomicWrite(targetPath, backup.content);
 			return true;
 		} catch (error) {
 			console.error("Failed to restore backup:", error);
@@ -213,12 +203,12 @@ export class ConfigRecovery {
 	/**
 	 * Try to recover config from backups
 	 */
-	tryRecover(targetPath: string): ConfigBackup | undefined {
+	tryRecover(targetPath: string, validate: (content: string) => unknown = JSON.parse): ConfigBackup | undefined {
 		const backups = this.listBackups();
 		for (const backup of backups) {
 			try {
 				// Validate JSON
-				JSON.parse(backup.content);
+				validate(backup.content);
 				if (this.restore(backup, targetPath)) {
 					return backup;
 				}
@@ -241,7 +231,7 @@ export class ConfigRecovery {
 			const toDelete = backups.slice(this.maxBackups);
 			for (const backup of toDelete) {
 				try {
-					require("node:fs").unlinkSync(backup.path);
+					unlinkSync(backup.path);
 				} catch {
 					// Ignore deletion failures
 				}
@@ -283,12 +273,12 @@ export function safeReadConfig<T>(
 			const ctx = errorHandler.record(
 				"recoverable",
 				"CONFIG_PARSE_ERROR",
-				`Failed to parse config: ${error instanceof Error ? error.message : String(error)}`,
+				"Config is unreadable or contains invalid JSON",
 				{ configPath }
 			);
 
 			// Try to recover from backup
-			const backup = recovery.tryRecover(configPath);
+			const backup = recovery.tryRecover(configPath, parser);
 			if (backup) {
 				try {
 					const data = parser(backup.content);
@@ -332,13 +322,7 @@ export function safeWriteConfig(
 		// Validate JSON before writing
 		JSON.parse(content);
 
-		// Write atomically (implemented in config.ts)
-		const dir = dirname(configPath);
-		mkdirSync(dir, { recursive: true });
-		const tmp = `${configPath}.tmp.${process.pid}.${Date.now()}`;
-
-		writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600 });
-		require("node:fs").renameSync(tmp, configPath);
+		atomicWrite(configPath, content);
 
 		return { success: true };
 	} catch (error) {

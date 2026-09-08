@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import type { RelayApi, RelayProviderEntry, CompiledOverride } from "./types.ts";
-import { inferReasoningSupport } from "./reasoning.ts";
+import { canonicalBaseUrl, isSafeIdentifier, isTokenLimit, MAX_DISCOVERED_MODELS, MAX_RESPONSE_BYTES, safeError } from "./security.ts";
 import {
 	DISCOVERY_TIMEOUT_MS,
 	MAX_RETRIES,
@@ -25,14 +25,15 @@ export class RateLimiter {
 	private pending: Promise<void> = Promise.resolve();
 
 	constructor(baseDelayMs: number = DEFAULT_TEST_REQUEST_DELAY_MS) {
-		this.baseDelayMs = baseDelayMs;
+		this.baseDelayMs = Number.isFinite(baseDelayMs) ? Math.max(0, Math.min(10_000, baseDelayMs)) : DEFAULT_TEST_REQUEST_DELAY_MS;
 	}
 
-	async acquire(): Promise<void> {
+	async acquire(signal?: AbortSignal): Promise<void> {
 		const acquire = this.pending.then(async () => {
+			signal?.throwIfAborted();
 			const delay = this.calculateDelay();
 			const waitMs = Math.max(0, this.lastRequest + delay - Date.now());
-			if (waitMs > 0) await sleep(waitMs);
+			if (waitMs > 0) await sleep(waitMs, signal);
 			this.lastRequest = Date.now();
 		});
 		this.pending = acquire.catch(() => undefined);
@@ -64,63 +65,68 @@ export class RateLimiter {
 // Fetch with timeout & retry
 // ---------------------------------------------------------------------------
 
-export function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) { reject(signal.reason); return; }
+		const finish = () => { signal?.removeEventListener("abort", abort); resolve(); };
+		const timer = setTimeout(finish, ms);
+		const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(signal?.reason); };
+		signal?.addEventListener("abort", abort, { once: true });
+	});
 }
 
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const abort = () => reject(signal.reason);
+		if (signal.aborted) abort();
+		else signal.addEventListener("abort", abort, { once: true });
+		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+	});
+}
+
+/** Buffer a bounded body under the same deadline as the connection itself. */
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
 	const controller = new AbortController();
-	if (init.signal) {
-		if (init.signal.aborted) {
-			controller.abort();
-		} else {
-			init.signal.addEventListener("abort", () => controller.abort(), { once: true });
-		}
-	}
-	const timer = setTimeout(() => controller.abort(), timeoutMs);
-	let timerCleared = false;
-	const clearTimer = () => {
-		if (!timerCleared) {
-			timerCleared = true;
-			clearTimeout(timer);
-		}
-	};
-
+	const abort = () => controller.abort(init.signal?.reason);
+	if (init.signal?.aborted) abort();
+	else init.signal?.addEventListener("abort", abort, { once: true });
+	const timer = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 	try {
-		const response = await fetch(url, { ...init, signal: controller.signal });
-
-		const origJson = response.json.bind(response);
-		const origText = response.text.bind(response);
-
-		const wrapWithAbort = <T>(promise: Promise<T>): Promise<T> => {
-			if (controller.signal.aborted) {
-				clearTimer();
-				throw new RelayError("timeout", `request to ${url} timed out after ${timeoutMs / 1000}s`);
-			}
-			const abortPromise = new Promise<never>((_, reject) => {
-				controller.signal.addEventListener(
-					"abort",
-					() => {
-						clearTimer();
-						reject(new RelayError("timeout", `request to ${url} timed out after ${timeoutMs / 1000}s`));
-					},
-					{ once: true },
-				);
-			});
-			return Promise.race([promise, abortPromise]).finally(() => {
-				clearTimer();
-			});
-		};
-
-		response.json = () => wrapWithAbort(origJson());
-		response.text = () => wrapWithAbort(origText());
-
-		return response;
+		controller.signal.throwIfAborted();
+		const response = await abortable(fetch(url, { ...init, redirect: "error", signal: controller.signal }), controller.signal);
+		const declaredSize = Number(response.headers.get("content-length"));
+		if (declaredSize > MAX_RESPONSE_BYTES) {
+			void response.body?.cancel().catch(() => {});
+			throw new RelayError("payload", "Model discovery response exceeds 5 MiB");
+		}
+		if (!response.ok || !response.body) {
+			void response.body?.cancel().catch(() => {});
+			return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers });
+		}
+		reader = response.body.getReader();
+		const chunks: Uint8Array[] = [];
+		let size = 0;
+		while (true) {
+			const chunk = await abortable(reader.read(), controller.signal);
+			if (chunk.done) break;
+			size += chunk.value.byteLength;
+			if (size > MAX_RESPONSE_BYTES) throw new RelayError("payload", "Model discovery response exceeds 5 MiB");
+			chunks.push(chunk.value);
+		}
+		const body = new Uint8Array(size);
+		let offset = 0;
+		for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+		return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 	} catch (error) {
-		clearTimer();
-		if (controller.signal.aborted)
-			throw new RelayError("timeout", `request to ${url} timed out after ${timeoutMs / 1000}s`);
-		throw new RelayError("network", `request to ${url} failed: ${error instanceof Error ? error.message : String(error)}`);
+		if (init.signal?.aborted) throw init.signal.reason;
+		if (controller.signal.aborted) throw new RelayError("timeout", `Request timed out after ${timeoutMs / 1000}s`);
+		if (error instanceof RelayError) throw error;
+		throw new RelayError("network", `Discovery request failed: ${safeError(error)}`);
+	} finally {
+		clearTimeout(timer);
+		init.signal?.removeEventListener("abort", abort);
+		if (reader) { void reader.cancel().catch(() => {}); }
 	}
 }
 
@@ -154,17 +160,19 @@ export async function fetchWithRetry(
 	let lastError: Error | undefined;
 
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		init.signal?.throwIfAborted();
 		try {
 			const response = await fetchWithTimeout(url, init, timeoutMs);
 			if (response.ok || ![408, 425, 429, 500, 502, 503, 504].includes(response.status) || attempt >= maxRetries) {
 				return response;
 			}
 			const delayMs = parseRetryAfter(response.headers.get("retry-after")) ?? Math.min(1000 * Math.pow(2, attempt), 5000);
-			await sleep(delayMs);
+			await sleep(delayMs, init.signal ?? undefined);
 		} catch (error) {
+			init.signal?.throwIfAborted();
 			lastError = error instanceof Error ? error : new Error(String(error));
-			if (error instanceof RelayError && error.code === "auth") throw error;
-			if (attempt < maxRetries) await sleep(Math.min(1000 * Math.pow(2, attempt), 5000));
+			if (error instanceof RelayError && ["auth", "payload"].includes(error.code)) throw error;
+			if (attempt < maxRetries) await sleep(Math.min(1000 * Math.pow(2, attempt), 5000), init.signal ?? undefined);
 		}
 	}
 
@@ -188,49 +196,60 @@ export interface DiscoveredModel {
 	hasImageInput?: boolean;
 }
 
-export async function fetchModelList(baseUrl: string, apiKey: string | undefined): Promise<DiscoveredModel[]> {
-	const url = `${baseUrl.replace(/\/+$/, "")}/v1/models`;
+export async function fetchModelList(
+	baseUrl: string,
+	apiKey: string | undefined,
+	options: { signal?: AbortSignal; allowInsecureHttp?: boolean } = {},
+): Promise<DiscoveredModel[]> {
+	const base = canonicalBaseUrl(baseUrl, options.allowInsecureHttp);
+	if (!base) throw new RelayError("network", "Use HTTPS for remote gateways; HTTP is allowed for loopback or an explicit allowInsecureHttp setting.");
+	const url = `${base}/v1/models`;
 	const headers: Record<string, string> = {};
 	if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-	const response = await fetchWithRetry(url, { headers }, DISCOVERY_TIMEOUT_MS);
+	const response = await fetchWithRetry(url, { headers, signal: options.signal }, DISCOVERY_TIMEOUT_MS);
 
 	if (response.status === 401 || response.status === 403) {
-		throw new RelayError("auth", `GET /v1/models returned ${response.status} — run /login first`);
+		throw new RelayError("auth", `GET /v1/models returned ${response.status} — check the configured key or /login credential`);
 	}
 	if (!response.ok) {
 		throw new RelayError("http", `GET /v1/models returned ${response.status} ${response.statusText}`);
 	}
 
-	const json = (await response.json()) as { data?: unknown };
+	let json: { data?: unknown };
+	try { json = await response.json() as { data?: unknown }; }
+	catch { throw new RelayError("payload", "/v1/models returned invalid JSON"); }
 	if (!json || typeof json !== "object" || !Array.isArray(json.data)) {
 		throw new RelayError("payload", "/v1/models payload has no data array");
 	}
 
+	if (json.data.length > MAX_DISCOVERED_MODELS) throw new RelayError("payload", "Gateway returned more than 10,000 models");
+	const seen = new Set<string>();
 	const output: DiscoveredModel[] = [];
 
 	for (const item of json.data) {
 		if (!item || typeof item !== "object") continue;
 		const record = item as Record<string, unknown>;
-		if (typeof record.id !== "string" || !record.id.trim()) continue;
+		if (!isSafeIdentifier(record.id) || seen.has(record.id)) continue;
+		seen.add(record.id);
 
 		const types = Array.isArray(record.supported_endpoint_types)
 			? record.supported_endpoint_types.filter((x): x is string => typeof x === "string")
 			: [];
 
 		const contextWindow =
-			typeof record.max_context === "number" && record.max_context > 0
+			isTokenLimit(record.max_context)
 				? record.max_context
-				: typeof record.context_window === "number" && record.context_window > 0
+				: isTokenLimit(record.context_window)
 					? record.context_window
-					: typeof record.contextWindow === "number" && record.contextWindow > 0
+					: isTokenLimit(record.contextWindow)
 						? record.contextWindow
 						: undefined;
 
 		const maxTokens =
-			typeof record.max_tokens === "number" && record.max_tokens > 0
+			isTokenLimit(record.max_tokens)
 				? record.max_tokens
-				: typeof record.maxTokens === "number" && record.maxTokens > 0
+				: isTokenLimit(record.maxTokens)
 					? record.maxTokens
 					: undefined;
 
@@ -241,7 +260,7 @@ export async function fetchModelList(baseUrl: string, apiKey: string | undefined
 					? record.supports_reasoning
 					: undefined;
 
-		const reasoning = explicitReasoning ?? inferReasoningSupport(record.id);
+		const reasoning = explicitReasoning;
 
 		const thinkingMode =
 			typeof record.thinking_mode === "string" && ["auto", "enabled", "disabled"].includes(record.thinking_mode)
@@ -277,10 +296,15 @@ export function compileOverrides(overrides: Record<string, RelayApi>): CompiledO
 	const rules: CompiledOverride[] = [];
 	for (const [pattern, api] of Object.entries(overrides ?? {})) {
 		if (!SUPPORTED_APIS.has(api)) continue;
+		// Exact pins and simple prefix/suffix rules need no groups or nested repetition.
+		// Multiple optional atoms and repeated alternations can backtrack exponentially too.
+		const plain = pattern.replace(/\\./g, "").replace(/\[[^\]]*\]/g, "");
+		if (pattern.length > 1024 || /\\[1-9]/.test(pattern) || /[(){}]/.test(plain) ||
+			(plain.match(/[*+?]/g)?.length ?? 0) > 1) continue;
 		try {
 			rules.push({ regex: new RegExp(pattern), api });
 		} catch (error) {
-			console.warn(`ai-gateway: invalid modelApiOverrides regex "${pattern}": ${error instanceof Error ? error.message : String(error)}`);
+			console.warn(`ai-gateway: invalid modelApiOverrides regex: ${safeError(error)}`);
 		}
 	}
 	return rules;
@@ -295,7 +319,7 @@ export function resolveApi(types: readonly string[], modelId: string, entry: Rel
 	if (matched) return matched.api;
 	const gatewayApis = new Set<RelayApi>();
 	for (const type of types) {
-		for (const api of ENDPOINT_TYPE_TO_APIS[type] ?? []) gatewayApis.add(api);
+		for (const api of Object.hasOwn(ENDPOINT_TYPE_TO_APIS, type) ? ENDPOINT_TYPE_TO_APIS[type] : []) gatewayApis.add(api);
 	}
 	if (gatewayApis.has(entry.defaultApi)) return entry.defaultApi;
 	for (const api of API_PREFERENCE) {

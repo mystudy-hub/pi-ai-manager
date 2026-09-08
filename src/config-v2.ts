@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { join } from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { settingsDirectory } from "./paths.ts";
 import type { RelayConfig } from "./types.ts";
 import { ConfigRecovery, ErrorHandler, safeReadConfig, safeWriteConfig } from "./error-handler.ts";
 
@@ -16,16 +16,12 @@ let errorHandlerInstance: ErrorHandler | undefined;
 
 function getBackupDir(): string {
 	// Use the same directory as config but in a backups subdirectory
-	const settingsDir =
-		process.env.PI_EXTENSION_SETTINGS_DIR ||
-		join(require("node:os").homedir(), ".pi", "agent", "extension-settings");
+	const settingsDir = settingsDirectory();
 	return join(settingsDir, "backups");
 }
 
 function getErrorLogPath(): string {
-	const settingsDir =
-		process.env.PI_EXTENSION_SETTINGS_DIR ||
-		join(require("node:os").homedir(), ".pi", "agent", "extension-settings");
+	const settingsDir = settingsDirectory();
 	return join(settingsDir, "ai-gateway-errors.log");
 }
 
@@ -52,8 +48,7 @@ export function getErrorHandlerInstance(): ErrorHandler {
  */
 export function readConfigSafe(): RelayConfig {
 	const configPath = join(
-		process.env.PI_EXTENSION_SETTINGS_DIR ||
-			join(require("node:os").homedir(), ".pi", "agent", "extension-settings"),
+		settingsDirectory(),
 		"provider-ai.json"
 	);
 
@@ -89,8 +84,7 @@ export function readConfigSafe(): RelayConfig {
  */
 export function writeConfigSafe(config: RelayConfig): boolean {
 	const configPath = join(
-		process.env.PI_EXTENSION_SETTINGS_DIR ||
-			join(require("node:os").homedir(), ".pi", "agent", "extension-settings"),
+		settingsDirectory(),
 		"provider-ai.json"
 	);
 
@@ -137,8 +131,7 @@ export function restoreFromBackup(timestamp: number): boolean {
 	}
 
 	const configPath = join(
-		process.env.PI_EXTENSION_SETTINGS_DIR ||
-			join(require("node:os").homedir(), ".pi", "agent", "extension-settings"),
+		settingsDirectory(),
 		"provider-ai.json"
 	);
 
