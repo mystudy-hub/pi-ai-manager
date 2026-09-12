@@ -57,7 +57,7 @@ async function createHarness() {
     // Jiti resolves built-ins before virtual modules. Route only storage's fs import
     // through a delegating wrapper so I/O failure tests do not patch process-wide fs.
     transform: options => ({ code: transpiler.transform({ ...options,
-      source: options.filename === path.join(root, 'src', 'storage.ts')
+      source: (options.filename && options.filename.replace(/\\/g, '/').endsWith('/src/storage.ts'))
         ? options.source.replace('"node:fs"', '"test:fs"') : options.source,
     }) }),
     virtualModules: {

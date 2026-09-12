@@ -5,6 +5,9 @@
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import assert from "node:assert";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
 
 const cwd = process.cwd();
 const reasoningPath = pathToFileURL(join(cwd, "src", "reasoning.ts")).href;
@@ -15,8 +18,34 @@ async function runTests() {
 	console.log("Running reasoning support tests...\n");
 
 	const { inferReasoningSupport, inferThinkingLevelMap, inferModelCompat } = await import(reasoningPath);
-	const { buildModelConfigs } = await import(providerPath);
-	const { parseContextWindow } = await import(utilsPath);
+	let buildModelConfigs;
+	let parseContextWindow;
+	try {
+		const mod = await import(providerPath);
+		buildModelConfigs = mod.buildModelConfigs;
+		const utilsMod = await import(utilsPath);
+		parseContextWindow = utilsMod.parseContextWindow;
+	} catch {
+		let piRequire;
+		try {
+			piRequire = createRequire(join(process.env.PI_CODING_AGENT_PACKAGE_DIR || "C:/Users/maoju/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent", "package.json"));
+		} catch {
+			piRequire = require;
+		}
+		const { createJiti } = piRequire("jiti");
+		const tuiPackage = await import(pathToFileURL(piRequire.resolve('@earendil-works/pi-tui')).href);
+		const jiti = createJiti(import.meta.url, {
+			tryNative: false,
+			virtualModules: {
+				"@earendil-works/pi-ai/compat": { getProviders: () => ["anthropic", "openai"], getModels: () => [] },
+				"@earendil-works/pi-tui": tuiPackage,
+			},
+		});
+		const mod = jiti(join(cwd, "src", "provider.ts"));
+		buildModelConfigs = mod.buildModelConfigs;
+		const utilsMod = jiti(join(cwd, "src", "utils.ts"));
+		parseContextWindow = utilsMod.parseContextWindow;
+	}
 
 	// Test 1: DeepSeek reasoning models
 	console.log("Test 1: DeepSeek reasoning models");

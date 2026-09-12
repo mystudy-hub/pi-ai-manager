@@ -118,7 +118,7 @@ check('A failed settings write is reported and journal replay completes both-fil
   const draft = h.cfg.cloneConfig(base);
   draft.providers.alpha.enabledModels = [];
   h.setRenameHook((_from, to) => {
-    if (to === settingsPath()) throw Object.assign(new Error('injected settings write failure'), { code: 'EIO' });
+    if (path.resolve(to).toLowerCase().replace(/\\/g, '/') === path.resolve(settingsPath()).toLowerCase().replace(/\\/g, '/')) throw Object.assign(new Error('injected settings write failure'), { code: 'EIO' });
   });
   try { assert.throws(() => h.cfg.commitConfig(base, draft), /configuration was saved, but Pi settings sync failed/); }
   finally { h.setRenameHook(undefined); }
