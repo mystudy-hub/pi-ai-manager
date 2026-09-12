@@ -882,7 +882,6 @@ export class RelayManagerTUI {
 
 			const syncResult = syncProviderModels(entry, list, gateway);
 			this.draftCache = null;
-
 			if (this.state.selectedGateway === gateway) this.loadModels();
 
 			this.syncSummary = {
@@ -894,6 +893,9 @@ export class RelayManagerTUI {
 				selectedAddedIndex: 0,
 				scrollOffset: 0,
 			};
+			if (syncResult.addedModels.length > 0) {
+				this.state.mode = "sync-summary";
+			}
 
 			const addedInfo = syncResult.addedModels.length > 0 ? `，新增 ${syncResult.addedModels.length} 个新模型` : "，已是最新";
 			const noticeMsg = `已从中转站同步 ${gateway} 的 ${list.length} 个模型（现有 ${syncResult.updatedModels.length} 个${addedInfo}）；Enter 保存草稿。`;
@@ -1733,7 +1735,15 @@ export class RelayManagerTUI {
 
 		// u: 撤销本次更新
 		if (matchesKey(data, "u")) {
-			this.undoLastOperation();
+			if (entry && s.addedModels.length > 0) {
+				for (const id of s.addedModels) {
+					delete entry.models[id];
+				}
+				entry.enabledModels = entry.enabledModels.filter(id => !s.addedModels.includes(id));
+				this.draftCache = null;
+				this.loadModels();
+				this.notice = `已撤销本次同步新增的 ${s.addedModels.length} 个模型。`;
+			}
 			this.syncSummary = null;
 			this.state.mode = "browse";
 			return true;
@@ -1825,7 +1835,7 @@ export class RelayManagerTUI {
 			return false;
 		}
 		try {
-			return await this.ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
+			return await this.ctx.ui.custom<boolean>((tui: any, theme: any, _kb: any, done: (val: boolean) => void) => {
 				this.requestRender = () => { if (!this.isClosed) tui.requestRender(); };
 				return {
 					render: (width: number) => this.render(width, tui.terminal?.rows ?? terminalHeight(), theme),

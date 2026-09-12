@@ -7,8 +7,12 @@ const { pathToFileURL } = require('node:url');
 function resolvePiPackageDir() {
   const candidates = [process.env.PI_CODING_AGENT_PACKAGE_DIR];
   try { candidates.push(path.dirname(require.resolve('@earendil-works/pi-coding-agent'))); } catch {}
+  if (process.env.APPDATA) {
+    candidates.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@earendil-works', 'pi-coding-agent'));
+  }
   for (const directory of (process.env.PATH || '').split(path.delimiter)) {
     try { candidates.push(path.dirname(fs.realpathSync(path.join(directory, process.platform === 'win32' ? 'pi.cmd' : 'pi')))); } catch {}
+    try { candidates.push(path.join(directory, 'node_modules', '@earendil-works', 'pi-coding-agent')); } catch {}
   }
   for (const candidate of candidates.filter(Boolean)) {
     let directory = candidate;

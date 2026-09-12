@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { readConfig } from "./config.ts";
 import { RelayManagerTUI } from "./tui.ts";
 import { safeError, safeDisplay } from "./security.ts";
@@ -6,7 +6,7 @@ import { safeError, safeDisplay } from "./security.ts";
 export function registerCommands(pi: ExtensionAPI): void {
 	pi.registerCommand("ai-manager", {
 		description: "Interactive AI gateway manager (add/remove providers, models, testing)",
-		handler: async (args, ctx) => {
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("ai-manager requires TUI mode.", "error");
 				return;

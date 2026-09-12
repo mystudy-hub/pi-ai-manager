@@ -368,7 +368,38 @@ check('Sync models from gateway detects new, retained and missing models and upd
   assert.deepEqual(m.tui.syncSummary.updatedModels, ['gpt-5.4']);
   assert.equal(m.tui.syncSummary.totalRemote, 2);
 
-  const screen = m.tui.render(100, 24, h.theme).join('\n');
-  assert.match(screen, /更新模型/);
+  // Opens summary modal when new models are discovered
+  assert.equal(m.tui.state.mode, 'sync-summary');
+  const modalScreen = m.tui.render(100, 24, h.theme).join('\n');
+  assert.match(modalScreen, /中转站模型同步报告/);
+  assert.match(modalScreen, /claude-3-7-sonnet/);
+
+  // Press A to enable newly discovered models
+  await m.tui.handleInput('A');
+  assert.ok(m.config.providers.alpha.enabledModels.includes('claude-3-7-sonnet'));
+
+  // Press Escape to return to browse mode
+  await m.tui.handleInput('\x1b');
+  assert.equal(m.tui.state.mode, 'browse');
+  const browseScreen = m.tui.render(100, 24, h.theme).join('\n');
+  assert.match(browseScreen, /更新模型/);
 });
+
+check('Sync models summary supports undoing newly added models', async () => {
+  h.reset(fixture());
+  global.fetch = async () => discovery([
+    { id: 'gpt-5.4', max_tokens: 4096 },
+    { id: 'new-model-xyz', supported_endpoint_types: ['openai'] },
+  ]);
+  const m = h.manager();
+  await m.tui.handleInput('r');
+  assert.equal(m.tui.state.mode, 'sync-summary');
+  assert.ok(m.config.providers.alpha.models['new-model-xyz']);
+
+  // Press u to undo the sync additions
+  await m.tui.handleInput('u');
+  assert.equal(m.tui.state.mode, 'browse');
+  assert.equal(m.config.providers.alpha.models['new-model-xyz'], undefined);
+});
+
 
