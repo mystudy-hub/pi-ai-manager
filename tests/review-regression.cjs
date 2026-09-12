@@ -343,3 +343,32 @@ check('Custom component renders in-flight progress and catches async input error
   m.component.handleInput('\x1b');
   assert.equal(await run, false);
 });
+
+check('Sync models from gateway detects new, retained and missing models and updates TUI summary', async () => {
+  h.reset(fixture());
+  const started = deferred();
+  const response = deferred();
+  global.fetch = async () => { started.resolve(); return response.promise; };
+  const m = h.manager();
+  const syncPromise = m.tui.handleInput('r');
+  await started.promise;
+  response.resolve(discovery([
+    { id: 'gpt-5.4', max_tokens: 4096 },
+    { id: 'claude-3-7-sonnet', supported_endpoint_types: ['anthropic'], reasoning: true, context_window: 200000 },
+  ]));
+  await syncPromise;
+
+  assert.ok(m.config.providers.alpha.models['claude-3-7-sonnet']);
+  assert.equal(m.config.providers.alpha.models['claude-3-7-sonnet'].api, 'anthropic-messages');
+  assert.equal(m.config.providers.alpha.models['claude-3-7-sonnet'].reasoning, true);
+  assert.equal(m.config.providers.alpha.models['claude-3-7-sonnet'].contextWindow, 200000);
+
+  assert.ok(m.tui.syncSummary);
+  assert.deepEqual(m.tui.syncSummary.addedModels, ['claude-3-7-sonnet']);
+  assert.deepEqual(m.tui.syncSummary.updatedModels, ['gpt-5.4']);
+  assert.equal(m.tui.syncSummary.totalRemote, 2);
+
+  const screen = m.tui.render(100, 24, h.theme).join('\n');
+  assert.match(screen, /更新模型/);
+});
+

@@ -20,7 +20,7 @@ import { scoreModel, filterModels } from "./model-scoring.ts";
 import { canonicalBaseUrl, cloneConfig, commitConfig, readCurrentConfig } from "./config.ts";
 import { isEnvName, safeDisplay, safeError } from "./security.ts";
 import { RateLimiter, compileOverrides, fetchModelList, type DiscoveredModel } from "./network.ts";
-import { registerProviderFor, applyDiscovery, modelLimits, modelReasoning, providerApiKey, hasProviderAuth } from "./provider.ts";
+import { registerProviderFor, applyDiscovery, syncProviderModels, modelLimits, modelReasoning, providerApiKey, hasProviderAuth } from "./provider.ts";
 import { testModelsInParallel, testModel as testModelFn, pickQuestions, applyTestResultToMeta } from "./testing.ts";
 import { normalizeModelName, findDuplicateModels, compareInstances } from "./dedup.ts";
 import { detectDefaultApi } from "./api-detect.ts";
@@ -35,7 +35,17 @@ import { COMMANDS, MODEL_SETTING_COMMANDS, HELP_TEXT, FILTER_LABELS, QUALITY_LAB
 // Local types for TUI state
 // ---------------------------------------------------------------------------
 
-type TuiMode = "browse" | "form" | "context" | "pattern" | "help" | "details" | "changes" | "compare" | "menu";
+type TuiMode = "browse" | "form" | "context" | "pattern" | "help" | "details" | "changes" | "compare" | "menu" | "sync-summary";
+
+interface SyncSummaryState {
+	gateway: string;
+	totalRemote: number;
+	addedModels: string[];
+	updatedModels: string[];
+	missingModels: string[];
+	selectedAddedIndex: number;
+	scrollOffset: number;
+}
 
 interface TUIState {
 	mode: TuiMode;
@@ -126,6 +136,7 @@ export class RelayManagerTUI {
 	private pattern: { kind: "enable" | "disable"; input: TextInput } | null = null;
 	private form: AddProviderForm | null = null;
 	private contextForm: ContextWindowForm | null = null;
+	private syncSummary: SyncSummaryState | null = null;
 	/** Gateway pending deletion confirmation. */
 	private confirmDelete: string | null = null;
 	/** An async form action is in flight; Escape still cancels it. */
@@ -504,6 +515,7 @@ export class RelayManagerTUI {
 			help: "快捷键帮助", details: "详情", changes: "未保存变更", compare: "网关比较",
 			menu: this.menu?.kind === "filters" ? "筛选模型" : "操作菜单",
 			form: this.form?.editingName ? "编辑网关" : "新增网关", context: "设置上下文", pattern: "批量选择",
+			"sync-summary": "中转站模型更新报告",
 		};
 		const title = beside(titles[this.state.mode] ?? "AI Manager", dirty, size.width);
 		let body: string[];
@@ -562,6 +574,12 @@ export class RelayManagerTUI {
 			body = this.renderPanel(["删除网关：" + this.confirmDelete,
 				"将移除 " + (entry?.enabledModels.length ?? 0) + " 个已启用模型。修改先加入草稿，u 可撤销。"], size);
 			footer = ["确认后仍需在主界面保存", dialogFooter(size.width, "确认删除")];
+		} else if (this.state.mode === "sync-summary" && this.syncSummary) {
+			body = this.renderSyncSummary(size, theme);
+			footer = [
+				fitHints(["A 全部启用新模型", "Space 切换勾选", "u 撤销更新", "↑↓ 滚动"], size.width),
+				dialogFooter(size.width, "完成", "返回"),
+			];
 		} else {
 			body = this.renderBrowse(size, theme);
 			if (this.state.isFiltering) footer = [
@@ -618,8 +636,14 @@ export class RelayManagerTUI {
 		const entry = this.config.providers[name];
 		const selected = name === this.state.selectedGateway;
 		const label = (selected ? "> " : "  ") + safeDisplay(name);
-		const counts = entry.enabledModels.length + "/" + Object.keys(entry.models).length;
-		return beside(selected && this.state.activePane === "gateways" ? theme.bold(label) : label, counts, width);
+		const countText = entry.enabledModels.length + "/" + Object.keys(entry.models).length;
+		const counts = entry.enabledModels.length > 0 ? theme.fg("success", countText) : theme.fg("dim", countText);
+		const styledLabel = selected && this.state.activePane === "gateways"
+			? theme.bold(theme.fg("accent", label))
+			: selected
+				? theme.fg("accent", label)
+				: label;
+		return beside(styledLabel, counts, width);
 	}
 
 	private renderBrowse(size: ScreenSize, theme: ViewTheme): string[] {
@@ -698,6 +722,52 @@ export class RelayManagerTUI {
 		const color = f.statusKind === "error" ? "error" : f.statusKind === "warning" ? "warning" : "dim";
 		lines.push(...status.slice(0, statusRows).map(line => theme.fg(color, line)));
 		return lines;
+	}
+
+	private renderSyncSummary(size: ScreenSize, theme: ViewTheme): string[] {
+		const s = this.syncSummary!;
+		const lines: string[] = [];
+		const entry = this.config.providers[s.gateway];
+		const w = size.width;
+
+		lines.push(cell(theme.bold(theme.fg("accent", `📡 中转站模型同步报告 · [${s.gateway}]`)), w));
+		lines.push(cell(`远程模型: ${s.totalRemote} 个  │  🟢 新增: +${s.addedModels.length}  │  ⚪ 现有: ${s.updatedModels.length}  │  🔴 远端未返回: ${s.missingModels.length}`, w));
+		lines.push(theme.fg("dim", "─".repeat(Math.max(1, w))));
+
+		if (s.addedModels.length > 0) {
+			lines.push(theme.fg("success", `🟢 本次新发现 ${s.addedModels.length} 个模型 (按 [A] 一键全部启用，或按 [Space] 单独切换)：`));
+			const maxRows = Math.max(2, size.bodyRows - 7);
+			const start = s.scrollOffset;
+			const end = Math.min(s.addedModels.length, start + maxRows);
+
+			for (let i = start; i < end; i++) {
+				const id = s.addedModels[i];
+				const isSelected = i === s.selectedAddedIndex;
+				const isEnabled = entry?.enabledModels.includes(id) ?? false;
+				const meta = entry?.models[id];
+				const pointer = isSelected ? theme.fg("accent", "▶") : " ";
+				const check = isEnabled ? theme.fg("success", "[x]") : "[ ]";
+				const reasoning = meta?.reasoning ? theme.fg("accent", " 🧠推理") : "";
+				const vision = meta?.input?.includes("image") ? theme.fg("warning", " 🖼️视觉") : "";
+				const ctx = meta?.contextWindow ? theme.fg("dim", ` ${Math.round(meta.contextWindow / 1024)}k`) : "";
+				const text = `${pointer} ${check} ${isSelected ? theme.bold(id) : id}${reasoning}${vision}${ctx}`;
+				lines.push(cell(text, w));
+			}
+			if (s.addedModels.length > maxRows) {
+				lines.push(theme.fg("dim", cell(`  ... 显示 ${start + 1}-${end} / 共 ${s.addedModels.length} 个新模型 (↑↓ 滚动)`, w)));
+			}
+		} else {
+			lines.push(theme.fg("success", "🎉 本地模型库与中转站完全一致，未发现新增模型。"));
+			lines.push(theme.fg("dim", "已有模型的最新兼容格式与端点参数已无缝刷新。"));
+		}
+
+		if (s.missingModels.length > 0 && lines.length < size.bodyRows - 1) {
+			lines.push("");
+			lines.push(theme.fg("dim", cell(`🔴 远端本次未返回的模型 (${s.missingModels.length} 个): ${s.missingModels.slice(0, 4).join(", ")}${s.missingModels.length > 4 ? "..." : ""}`, w)));
+		}
+
+		while (lines.length < size.bodyRows) lines.push("");
+		return lines.slice(0, size.bodyRows);
 	}
 
 	private commandBlocked(command: Command): string | undefined {
@@ -798,17 +868,36 @@ export class RelayManagerTUI {
 		const gateway = this.state.selectedGateway;
 		const entry = this.config.providers[gateway];
 		if (!entry) return;
+
+		const previousModels = JSON.parse(JSON.stringify(entry.models));
+		const previousEnabled = [...entry.enabledModels];
+
 		await this.runTask(async controller => {
-			this.taskLabel = `发现 ${gateway}`;
-			this.ctx.ui.setStatus("ai-manager", `Discovering ${gateway}…`);
+			this.taskLabel = `同步中转站模型: ${gateway}`;
+			this.ctx.ui.setStatus("ai-manager", `正在从中转站 ${gateway} 同步支持的模型…`);
 			const key = await providerApiKey(this.ctx, gateway, entry);
 			if (!this.taskIsCurrent(controller)) return;
 			const list = await fetchModelList(entry.baseUrl, key, { signal: controller.signal, allowInsecureHttp: entry.allowInsecureHttp });
 			if (!this.taskIsCurrent(controller)) return;
-			applyDiscovery(entry, list);
+
+			const syncResult = syncProviderModels(entry, list, gateway);
 			this.draftCache = null;
+
 			if (this.state.selectedGateway === gateway) this.loadModels();
-			this.notice = `已发现 ${gateway} 的 ${list.length} 个模型；Enter 保存草稿。`;
+
+			this.syncSummary = {
+				gateway,
+				totalRemote: syncResult.totalRemote,
+				addedModels: syncResult.addedModels,
+				updatedModels: syncResult.updatedModels,
+				missingModels: syncResult.missingModels,
+				selectedAddedIndex: 0,
+				scrollOffset: 0,
+			};
+
+			const addedInfo = syncResult.addedModels.length > 0 ? `，新增 ${syncResult.addedModels.length} 个新模型` : "，已是最新";
+			const noticeMsg = `已从中转站同步 ${gateway} 的 ${list.length} 个模型（现有 ${syncResult.updatedModels.length} 个${addedInfo}）；Enter 保存草稿。`;
+			this.notice = noticeMsg;
 			this.ctx.ui.notify(`Discovered ${list.length} models for ${gateway}. Enter saves the draft.`, "info");
 		});
 	}
@@ -988,18 +1077,20 @@ export class RelayManagerTUI {
 	private async refreshAllGateways(): Promise<void> {
 		await this.runTask(async controller => {
 			let successful = 0;
+			let totalAdded = 0;
 			const entries = Object.entries(this.config.providers);
 			for (const [name, entry] of entries) {
 				if (!this.taskIsCurrent(controller)) return;
-				this.taskLabel = `发现 ${name}（${successful}/${entries.length}）`;
+				this.taskLabel = `同步 ${name}（${successful}/${entries.length}）`;
 				this.requestRender();
-				this.ctx.ui.setStatus("ai-manager", `Discovering ${name}…`);
+				this.ctx.ui.setStatus("ai-manager", `正在同步中转站 ${name}…`);
 				try {
 					const key = await providerApiKey(this.ctx, name, entry);
 					if (!this.taskIsCurrent(controller)) return;
 					const list = await fetchModelList(entry.baseUrl, key, { signal: controller.signal, allowInsecureHttp: entry.allowInsecureHttp });
 					if (!this.taskIsCurrent(controller)) return;
-					applyDiscovery(entry, list);
+					const res = syncProviderModels(entry, list, name);
+					totalAdded += res.addedModels.length;
 					this.draftCache = null;
 					if (this.state.selectedGateway === name) this.loadModels();
 					successful++;
@@ -1010,7 +1101,7 @@ export class RelayManagerTUI {
 			}
 			if (!this.taskIsCurrent(controller)) return;
 			this.loadModels();
-			this.notice = `已刷新 ${successful}/${entries.length} 个网关；Enter 保存草稿。`;
+			this.notice = `已同步 ${successful}/${entries.length} 个中转站（共新增 ${totalAdded} 个模型）；Enter 保存草稿。`;
 			this.ctx.ui.notify(`Refreshed ${successful}/${entries.length} gateways. Enter saves the draft.`, "info");
 		});
 	}
@@ -1301,6 +1392,7 @@ export class RelayManagerTUI {
 		if (this.state.mode === "form" && this.form) return this.handleFormInput(data);
 		if (this.state.mode === "context" && this.contextForm) return this.handleContextInput(data);
 		if (this.state.mode === "pattern" && this.pattern) return this.handlePatternInput(data);
+		if (this.state.mode === "sync-summary" && this.syncSummary) return this.handleSyncSummaryInput(data);
 		if (this.confirmDelete) return this.movePanel(data) || this.handleConfirmInput(data);
 
 		if (this.state.isFiltering) {
@@ -1576,6 +1668,94 @@ export class RelayManagerTUI {
 			this.pattern = null;
 			this.state.mode = "browse";
 		}
+		return true;
+	}
+
+	private async handleSyncSummaryInput(data: string): Promise<boolean> {
+		const s = this.syncSummary;
+		if (!s) {
+			this.state.mode = "browse";
+			return true;
+		}
+		const entry = this.config.providers[s.gateway];
+
+		if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter)) {
+			this.syncSummary = null;
+			this.state.mode = "browse";
+			return true;
+		}
+
+		// A: 一键启用全部新增模型
+		if (matchesKey(data, "a") || matchesKey(data, Key.shift("a"))) {
+			if (entry && s.addedModels.length > 0) {
+				const before = [...entry.enabledModels];
+				const merged = [...new Set([...entry.enabledModels, ...s.addedModels])];
+				const count = merged.length - entry.enabledModels.length;
+				entry.enabledModels = merged;
+				this.recordOperation(
+					"enable-pattern",
+					s.gateway,
+					`Enabled ${count} new models from sync`,
+					before,
+					entry.enabledModels,
+				);
+				this.draftCache = null;
+				this.loadModels();
+				this.notice = `已一键启用 ${count} 个新发现的模型！Enter 保存草稿。`;
+				this.ctx.ui.notify(`Enabled ${count} new models.`, "info");
+			}
+			return true;
+		}
+
+		// Space: 切换当前光标所在新增模型的启用
+		if (matchesKey(data, Key.space)) {
+			if (entry && s.addedModels.length > 0) {
+				const modelId = s.addedModels[s.selectedAddedIndex];
+				if (modelId) {
+					const before = [...entry.enabledModels];
+					const exists = entry.enabledModels.includes(modelId);
+					entry.enabledModels = exists
+						? entry.enabledModels.filter(id => id !== modelId)
+						: [...entry.enabledModels, modelId];
+					this.recordOperation(
+						"toggle-model",
+						s.gateway,
+						(exists ? "Disabled " : "Enabled ") + modelId,
+						before,
+						entry.enabledModels,
+					);
+					this.draftCache = null;
+					this.loadModels();
+				}
+			}
+			return true;
+		}
+
+		// u: 撤销本次更新
+		if (matchesKey(data, "u")) {
+			this.undoLastOperation();
+			this.syncSummary = null;
+			this.state.mode = "browse";
+			return true;
+		}
+
+		if (matchesKey(data, Key.up)) {
+			if (s.addedModels.length > 0) {
+				s.selectedAddedIndex = Math.max(0, s.selectedAddedIndex - 1);
+				if (s.selectedAddedIndex < s.scrollOffset) s.scrollOffset = s.selectedAddedIndex;
+			}
+			return true;
+		}
+
+		if (matchesKey(data, Key.down)) {
+			if (s.addedModels.length > 0) {
+				s.selectedAddedIndex = Math.min(s.addedModels.length - 1, s.selectedAddedIndex + 1);
+				const maxRows = Math.max(2, this.visibleRows - 7);
+				if (s.selectedAddedIndex >= s.scrollOffset + maxRows) s.scrollOffset = s.selectedAddedIndex - maxRows + 1;
+			}
+			return true;
+		}
+
 		return true;
 	}
 

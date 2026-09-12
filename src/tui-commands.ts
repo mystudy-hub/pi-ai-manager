@@ -36,8 +36,8 @@ export const COMMANDS = [
 	{ id: "add", keys: ["n"], keyHint: "n", label: "新增网关", short: "新增", group: "网关" },
 	{ id: "edit", keys: [Key.shift("e")], keyHint: "E", label: "编辑网关", short: "编辑", group: "网关", needs: "gateway" },
 	{ id: "delete", keys: [Key.shift("d")], keyHint: "D", label: "删除网关（先确认，也可 dd）", short: "删除", group: "网关", pane: "gateways", needs: "gateway" },
-	{ id: "refresh", keys: ["r"], keyHint: "r", label: "发现当前网关模型", short: "刷新", group: "网关", needs: "gateway" },
-	{ id: "refresh-all", keys: [Key.shift("r")], keyHint: "R", label: "发现所有网关模型", short: "全部刷新", group: "网关", needs: "gateway" },
+	{ id: "refresh", keys: ["r"], keyHint: "r", label: "从中转站更新支持的模型 (同步远程最新模型)", short: "更新模型", group: "同步", needs: "gateway" },
+	{ id: "refresh-all", keys: [Key.shift("r")], keyHint: "R", label: "从中转站更新所有网关模型", short: "全部更新", group: "同步", needs: "gateway" },
 	{ id: "test-all", keys: [Key.shift("a")], keyHint: "A", label: "测试所有网关的已启用模型（先确认）", short: "测试全部网关", group: "批量", needs: "gateway" },
 	{ id: "search", keys: ["/"], keyHint: "/", label: "搜索模型名称", short: "搜索", group: "查看", readOnly: true },
 	{ id: "filters", keys: ["f"], keyHint: "f", label: "选择状态 / 质量筛选或重置搜索", short: "筛选", group: "查看", readOnly: true },
@@ -68,7 +68,9 @@ export function commandHint(id: CommandId): string {
 }
 
 export function browseFooter(width: number, pane: "models" | "gateways", running: boolean): string[] {
-	const ids: CommandId[] = pane === "models" ? ["toggle", "details", "filters", "search", "help"] : ["add", "edit", "details", "delete", "help"];
+	const ids: CommandId[] = pane === "models"
+		? ["toggle", "refresh", "details", "filters", "search", "help"]
+		: ["add", "refresh", "edit", "details", "delete", "help"];
 	const actions = fitHints([commandHint("actions"), ...(pane === "models" ? MODEL_SETTING_COMMANDS.map(commandHint) : []),
 		"Tab 切栏", ...ids.map(commandHint), "↑↓ 移动"], width);
 	const save = running ? "Enter 停止并保存" : commandHint("save");

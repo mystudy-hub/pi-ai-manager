@@ -68,25 +68,39 @@ export function modelReasoning(entry: RelayProviderEntry, id: string): boolean {
 	return entry.models[id]?.reasoning ?? catalogueModel(id)?.reasoning ?? inferReasoningSupport(id);
 }
 
+export interface GatewaySyncResult {
+	gateway: string;
+	totalRemote: number;
+	addedModels: string[];
+	updatedModels: string[];
+	missingModels: string[];
+	timestamp: number;
+}
+
 /**
- * Merge a discovery result into a provider entry, in place.
- *
- * Discovered values only fill gaps: anything already stored wins, so a manual
- * contextWindow edit is not clobbered on the next refresh. Spreading `existing`
- * first is what preserves health and metrics across a re-discovery.
+ * Sync and merge discovery results into a provider entry in place.
+ * Returns structured details about added, updated, and missing models.
  */
-export function applyDiscovery(
+export function syncProviderModels(
 	entry: RelayProviderEntry,
 	list: readonly DiscoveredModel[],
-): { added: number; updated: number } {
+	gatewayName: string = "gateway",
+): GatewaySyncResult {
 	const rules = compileOverrides(entry.modelApiOverrides ?? {});
-	let added = 0;
-	let updated = 0;
+	const remoteIds = new Set<string>();
+	const addedModels: string[] = [];
+	const updatedModels: string[] = [];
+
 	for (const model of list) {
 		if (!isSafeIdentifier(model.id)) continue;
+		remoteIds.add(model.id);
 		const existing = entry.models[model.id];
-		if (existing) updated++;
-		else added++;
+		if (existing) {
+			updatedModels.push(model.id);
+		} else {
+			addedModels.push(model.id);
+		}
+
 		const api = resolveApi(model.types, model.id, entry, rules);
 		const reasoning =
 			existing?.reasoning !== undefined
@@ -115,7 +129,32 @@ export function applyDiscovery(
 			...(existing?.input !== undefined ? {} : model.hasImageInput ? { input: ["text", "image"] as ("text" | "image")[] } : {}),
 		};
 	}
-	return { added, updated };
+
+	const missingModels = Object.keys(entry.models).filter((id) => !remoteIds.has(id));
+
+	return {
+		gateway: gatewayName,
+		totalRemote: list.length,
+		addedModels,
+		updatedModels,
+		missingModels,
+		timestamp: Date.now(),
+	};
+}
+
+/**
+ * Merge a discovery result into a provider entry, in place.
+ *
+ * Discovered values only fill gaps: anything already stored wins, so a manual
+ * contextWindow edit is not clobbered on the next refresh. Spreading `existing`
+ * first is what preserves health and metrics across a re-discovery.
+ */
+export function applyDiscovery(
+	entry: RelayProviderEntry,
+	list: readonly DiscoveredModel[],
+): { added: number; updated: number } {
+	const res = syncProviderModels(entry, list);
+	return { added: res.addedModels.length, updated: res.updatedModels.length };
 }
 
 export function buildModelConfigs(entry: RelayProviderEntry, ids: readonly string[]): ProviderModelConfig[] {

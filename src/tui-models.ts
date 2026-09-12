@@ -66,13 +66,17 @@ export function modelLine(row: ModelRow, entry: RelayProviderEntry, selected: bo
 	// Old successful timings can still be inspected in details; do not attribute them to a failed run.
 	const elapsed = !row.testing && (health === "healthy" || health === "degraded") && row.meta.metrics
 		? `${Math.round(row.meta.metrics.avgResponseTime)}ms` : "—";
+	const latencyText = elapsed !== "—" && health === "healthy" ? theme.fg("success", elapsed)
+		: elapsed !== "—" && health === "degraded" ? theme.fg("warning", elapsed) : elapsed;
+	const reasoningText = modelReasoning(entry, row.id) ? theme.fg("accent", "支持") : "不支持";
+	const check = row.enabled ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
 	const name = cell(safeDisplay(row.id), columns.name);
-	return cell(`${selected ? theme.fg("accent", ">") : " "} ${row.enabled ? theme.fg("success", "[x]") : "[ ]"}  ${selected ? theme.bold(name) : name}` +
+	return cell(`${selected ? theme.fg("accent", ">") : " "} ${check}  ${selected ? theme.bold(name) : name}` +
 		(columns.protocol ? ` ${cell(API_LABELS[applyOverride(row.id, row.meta.api, rules)], columns.protocol)}` : "") +
-		(columns.reasoning ? ` ${cell(modelReasoning(entry, row.id) ? "支持" : "不支持", columns.reasoning)}` : "") +
+		(columns.reasoning ? ` ${cell(reasoningText, columns.reasoning)}` : "") +
 		(limits ? ` ${cell((limits.estimated ? "约" : "") + limits.contextWindow.toLocaleString("en-US"), columns.context)}` : "") +
 		(columns.status ? ` ${cell(theme.fg(status.color, status.text), columns.status)}` : "") +
-		(columns.latency ? ` ${cell(elapsed, columns.latency)}` : ""), width);
+		(columns.latency ? ` ${cell(latencyText, columns.latency)}` : ""), width);
 }
 
 /** Keep all model settings and their editing keys visible when table columns are hidden. */
