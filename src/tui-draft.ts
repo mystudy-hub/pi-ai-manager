@@ -30,7 +30,7 @@ function same(a: unknown, b: unknown): boolean {
 const MODEL_FIELDS: Partial<Record<keyof RelayModelMeta, string>> = {
 	api: "协议", discoveredApi: "发现协议", contextWindow: "上下文", maxTokens: "输出上限",
 	cost: "价格", reasoning: "推理声明", thinkingLevelMap: "推理等级", thinkingMode: "推理模式",
-	thinkingEffort: "推理强度", compat: "兼容选项", input: "输入类型",
+	thinkingEffort: "推理强度", compat: "兼容选项", input: "输入类型", shield: "脱敏保护",
 };
 
 function credentialSource(entry: RelayProviderEntry): string {
@@ -43,6 +43,10 @@ function modelFieldChange(before: RelayModelMeta, after: RelayModelMeta, field: 
 	if (field === "reasoning") {
 		const show = (value?: boolean) => value === undefined ? "自动" : value ? "支持" : "不支持";
 		return `${label} ${show(before.reasoning)} → ${show(after.reasoning)}`;
+	}
+	if (field === "shield") {
+		const show = (value?: boolean) => value === undefined ? "继承网关" : value ? "开启" : "关闭";
+		return `${label} ${show(before.shield)} → ${show(after.shield)}`;
 	}
 	return `${label}已修改`;
 }
@@ -71,6 +75,7 @@ export function summarizeDraft(baseline: RelayConfig, draft: RelayConfig): Draft
 		}
 		if (before.defaultApi !== after.defaultApi) add("config", `${name}：默认协议 ${before.defaultApi} → ${after.defaultApi}`);
 		if (!!before.allowInsecureHttp !== !!after.allowInsecureHttp) add("config", `${name}：HTTP 许可已修改`);
+		if (!!before.shield?.enabled !== !!after.shield?.enabled) add("config", `${name}：脱敏保护 (Shield) ${after.shield?.enabled ? "开启" : "关闭"}`);
 		// First matching rule wins, so a change in rule order is a real routing change.
 		if (!same(Object.entries(before.modelApiOverrides ?? {}), Object.entries(after.modelApiOverrides ?? {}))) add("config", `${name}：模型协议规则已修改`);
 		const wasEnabled = new Set(before.enabledModels);

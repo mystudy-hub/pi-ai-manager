@@ -10,6 +10,7 @@ import { compileOverrides, applyOverride, resolveApiBaseUrl, resolveApi, type Di
 import { inferReasoningSupport, inferThinkingLevelMap, inferModelCompat } from "./reasoning.ts";
 import { canonicalBaseUrl, isSafeIdentifier, literalCredential, isEnvName } from "./security.ts";
 import { validateName } from "./utils.ts";
+import { getGlobalShieldProxy } from "./shield/proxy.ts";
 
 type ModelDefaults = Pick<ProviderModelConfig, "contextWindow" | "maxTokens" | "input" | "reasoning">;
 let catalogue: Map<string, ModelDefaults> | undefined;
@@ -157,9 +158,11 @@ export function applyDiscovery(
 	return { added: res.addedModels.length, updated: res.updatedModels.length };
 }
 
-export function buildModelConfigs(entry: RelayProviderEntry, ids: readonly string[]): ProviderModelConfig[] {
+export function buildModelConfigs(entry: RelayProviderEntry, ids: readonly string[], baseUrlOverride?: string, gatewayName?: string): ProviderModelConfig[] {
 	const rules = compileOverrides(entry.modelApiOverrides ?? {});
 	const output: ProviderModelConfig[] = [];
+	const proxy = getGlobalShieldProxy();
+	const base = baseUrlOverride ?? entry.baseUrl;
 	for (const id of ids) {
 		if (!isSafeIdentifier(id) || !Object.hasOwn(entry.models, id)) continue;
 		const meta = entry.models[id];
@@ -171,11 +174,19 @@ export function buildModelConfigs(entry: RelayProviderEntry, ids: readonly strin
 		const thinkingLevelMap = meta.thinkingLevelMap ?? (reasoning ? inferThinkingLevelMap(id) : undefined);
 		const compat = meta.compat ?? (reasoning ? inferModelCompat(id, api) : undefined);
 
+		// Per-model shield decision:
+		// Model-level setting (meta.shield) takes precedence; if undefined, inherits gateway setting.
+		const isShielded = meta.shield ?? entry.shield?.enabled ?? false;
+		let effectiveModelBase = base;
+		if (gatewayName && proxy.isRunning()) {
+			effectiveModelBase = isShielded ? proxy.getLocalBaseUrl(gatewayName) : entry.baseUrl;
+		}
+
 		output.push({
 			id,
 			name: id,
 			api,
-			baseUrl: resolveApiBaseUrl(entry.baseUrl, api),
+			baseUrl: resolveApiBaseUrl(effectiveModelBase, api),
 			reasoning,
 			...(thinkingLevelMap ? { thinkingLevelMap: thinkingLevelMap as any } : {}),
 			...(compat ? { compat: compat as any } : {}),
@@ -205,13 +216,39 @@ export function registerProviderFor(pi: ExtensionAPI, name: string, entry: Relay
 	// Pi merges re-registrations: omitting a key alone would retain the previous key.
 	if (previous.get(name) && apiKey === undefined) pi.unregisterProvider(name);
 	const ids = idsOverride ?? entry.enabledModels;
+
+	const hasAnyShielded = Boolean(entry.shield?.enabled || ids.some((id) => entry.models[id]?.shield === true));
+	let effectiveBaseUrl = baseUrl;
+	if (hasAnyShielded) {
+		const proxy = getGlobalShieldProxy();
+		// Proxy must already be running (started by index.ts before this loop).
+		// If not running, skip shield routing — the provider will use the original baseUrl.
+		if (proxy.isRunning()) {
+			proxy.registerUpstream({
+				name,
+				targetBaseUrl: baseUrl,
+				options: {
+					rules: entry.shield?.rules as any,
+					customWords: entry.shield?.customWords,
+					customRules: entry.shield?.customRules,
+					maskToolArguments: entry.shield?.maskToolArguments,
+				},
+			});
+			if (entry.shield?.enabled) {
+				effectiveBaseUrl = proxy.getLocalBaseUrl(name);
+			}
+		}
+	} else {
+		getGlobalShieldProxy().unregisterUpstream(name);
+	}
+
 	pi.registerProvider(name, {
-		name: `AI (${name})`,
-		baseUrl,
+		name: entry.shield?.enabled ? `AI (${name}) 🛡️` : `AI (${name})`,
+		baseUrl: effectiveBaseUrl,
 		api: entry.defaultApi,
 		// Pi gives runtime and /login credentials precedence over this configured key.
 		...(apiKey !== undefined ? { apiKey } : {}),
-		models: buildModelConfigs(entry, ids),
+		models: buildModelConfigs(entry, ids, effectiveBaseUrl, name),
 	});
 	previous.set(name, apiKey !== undefined);
 	credentialRegistrations.set(pi, previous);

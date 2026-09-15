@@ -128,6 +128,69 @@ settings.json                               Pi 的 enabledModels 范围
 
 配置损坏时，读取路径会依次校验备份，找到有效备份才恢复。没有有效备份时报告错误并保留原文件。若配置已写入但 `settings.json` 同步失败，会明确报告部分完成，下次读取或保存时重放日志。不会将同步失败报告为保存成功，也不会覆盖其他网关或用户自定义的设置项。
 
+## 本地隐私脱敏网关 (Privacy Shield)
+
+扩展原生内置了专为 AI 编程助手与 Agent 打造的本地隐私脱敏与流式还原网关（原理与核心规则源自开源项目 **[Data Maskit](https://github.com/xiaYuTian11/maskit)**）。
+
+- **出站自动打码**：出网前将 API Key、PEM 私钥、云厂商 AK/SK、数据库连接密码、私网 IP、手机号、身份证、邮箱等 19 类敏感凭据及自定义词自动替换为结构化占位符（如 `{{CONNSTR_xxxxxx}}`、`{{PHONE_xxxxxx}}`）。
+- **打字机流式还原**：大模型返回 SSE 流式数据时，毫秒级滑动窗口切片缓冲，将占位符还原回原始文本，终端用户体验无感，上游服务商零明文泄漏。
+- **Tool Calls 安全脱敏**：深度适配工具调用参数（JSON 字符串反序列化后脱敏再序列化，不破坏 JSON 语法）。
+- **开箱即用**：在 `/ai-manager` 界面中光标停在目标网关，按大写 **`S`**（Shift+S）即可一键启闭脱敏保护（名称后显示 `🛡️` 图标）。
+
+### 规则的新增、修改与同步
+
+#### 方式 1：通过用户配置文件动态修改（免改代码）
+
+在 `~/.pi/agent/extension-settings/provider-ai.json` 的对应网关中添加 `shield` 配置字段：
+
+```json
+{
+  "providers": {
+    "cpa": {
+      "baseUrl": "https://cpa1.relwl.com",
+      "shield": {
+        "enabled": true,
+        "rules": {
+          "IP_INTERNAL": true,
+          "PLATE": false
+        },
+        "customWords": ["保密项目代号", "绝密算法X"],
+        "customRules": [
+          {
+            "label": "CORP_ID",
+            "pattern": "EMP-\\d{6}",
+            "flags": "g"
+          }
+        ],
+        "maskToolArguments": true
+      }
+    }
+  }
+}
+```
+
+- **开关内置规则**：在 `rules` 中将规则名设为 `true` 或 `false`（例如内置 19 类：`PRIVATE_KEY`, `API_KEY`, `ACCESS_KEY`, `JWT`, `TOKEN`, `SECRET`, `CONNSTR`, `PHONE`, `EMAIL`, `LANDLINE`, `PLATE`, `HKID`, `IDCARD`, `IP_PRIVATE`, `IP_INTERNAL`, `CARD`, `IBAN`, `USCC`, `MAC`）。
+- **添加敏感业务词**：在 `customWords` 中列出需要脱敏的专有名词或人名；亦支持对象形式 `{"词": "LABEL"}` 自定义占位符类型。
+- **添加自定义正则**：在 `customRules` 中定义任意正则规则，自动纳入脱敏与还原管道。
+
+#### 方式 2：在源码中扩展或同步上游规则
+
+规则定义源码位于：`src/shield/rules.ts`，关联上游仓库：
+- **上游仓库**：`https://github.com/xiaYuTian11/maskit`
+- **上游规则源码**：`https://github.com/xiaYuTian11/maskit/blob/master/engine/transparent.py`
+
+**一键比对上游最新规则**：
+```bash
+npm run sync-shield
+```
+该脚本会自动拉取 Maskit 官方最新规则，对比本地 19 类规则并提示是否有新增规则类别。
+
+若需永久新增内置规则：
+1. 打开 `src/shield/rules.ts`；
+2. 在 `BuiltinRuleLabel` 类型与 `DEFAULT_BUILTIN_RULES` 中加入规则名称与默认开关；
+3. 在 `BUILTIN_RULES` 数组中添加正则表达式与捕获组定义；
+4. 如需校验和校验（如 Luhn/身份证算法），在 `scanner.ts` 中挂载对应校验函数即可。
+
 ## 开发与验证
 
 ```bash

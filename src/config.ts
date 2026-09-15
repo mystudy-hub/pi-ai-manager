@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from "node:
 import { dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { HealthStatus, PerformanceMetrics, RelayApi, RelayConfig, RelayModelMeta, RelayProviderEntry, RelaySettings } from "./types.ts";
+import type { CustomShieldRule, HealthStatus, PerformanceMetrics, RelayApi, RelayConfig, RelayModelMeta, RelayProviderEntry, RelaySettings, ShieldSettings } from "./types.ts";
 import { CONFIG_FILENAME, MAX_TEST_CONCURRENCY, SUPPORTED_APIS } from "./types.ts";
 import { canonicalBaseUrl, isEnvName, isSafeIdentifier, isSafeProviderName, isTokenLimit } from "./security.ts";
 import { settingsDirectory } from "./paths.ts";
@@ -127,6 +127,7 @@ export function normalizeConfig(raw: unknown): RelayConfig {
 					health: normalizeHealthStatus(m.health),
 					metrics: normalizeMetrics(m.metrics),
 					...(typeof m.lastDiscovered === "number" ? { lastDiscovered: m.lastDiscovered } : {}),
+					...(typeof m.shield === "boolean" ? { shield: m.shield } : {}),
 				};
 			}
 		}
@@ -134,6 +135,8 @@ export function normalizeConfig(raw: unknown): RelayConfig {
 		const enabledModels = (Array.isArray(entry.enabledModels) ? entry.enabledModels : [])
 			.filter((x): x is string => typeof x === "string")
 			.filter((id) => Object.hasOwn(models, id));
+
+		const shield = normalizeShield(entry.shield);
 
 		providers[name] = {
 			baseUrl,
@@ -144,6 +147,7 @@ export function normalizeConfig(raw: unknown): RelayConfig {
 			modelApiOverrides,
 			models,
 			enabledModels: [...new Set(enabledModels)],
+			...(shield ? { shield } : {}),
 		};
 	}
 
@@ -158,6 +162,48 @@ export function normalizeConfig(raw: unknown): RelayConfig {
 	if (Number.isFinite(concurrency) && concurrency > 0) settings.testConcurrency = Math.min(concurrency, MAX_TEST_CONCURRENCY);
 
 	return { version: 1, providers, settings };
+}
+
+function normalizeShield(raw: unknown): ShieldSettings | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const s = raw as Record<string, unknown>;
+	if (typeof s.enabled !== "boolean") return undefined;
+	const rules: Record<string, boolean> = {};
+	if (s.rules && typeof s.rules === "object") {
+		for (const [k, v] of Object.entries(s.rules as Record<string, unknown>)) {
+			if (typeof v === "boolean") rules[k] = v;
+		}
+	}
+	let customWords: string[] | Record<string, string> | undefined;
+	if (Array.isArray(s.customWords)) {
+		customWords = s.customWords.filter((x): x is string => typeof x === "string" && x.trim().length > 0);
+	} else if (s.customWords && typeof s.customWords === "object") {
+		const dict: Record<string, string> = {};
+		for (const [k, v] of Object.entries(s.customWords as Record<string, unknown>)) {
+			if (typeof k === "string" && k.trim().length > 0 && typeof v === "string") {
+				dict[k] = v;
+			}
+		}
+		if (Object.keys(dict).length > 0) customWords = dict;
+	}
+
+	const customRules = Array.isArray(s.customRules)
+		? s.customRules.filter((r): r is CustomShieldRule =>
+			Boolean(r && typeof r === "object" && typeof (r as any).label === "string" && typeof (r as any).pattern === "string")
+		).map(r => ({
+			label: String(r.label).trim(),
+			pattern: String(r.pattern),
+			...(typeof r.flags === "string" ? { flags: r.flags } : {}),
+		}))
+		: undefined;
+
+	return {
+		enabled: s.enabled,
+		...(Object.keys(rules).length > 0 ? { rules } : {}),
+		...(customWords && (Array.isArray(customWords) ? customWords.length > 0 : Object.keys(customWords).length > 0) ? { customWords } : {}),
+		...(customRules && customRules.length > 0 ? { customRules } : {}),
+		...(typeof s.maskToolArguments === "boolean" ? { maskToolArguments: s.maskToolArguments } : {}),
+	};
 }
 
 export function normalizeCost(raw: unknown): RelayModelMeta["cost"] {
@@ -266,7 +312,7 @@ export function mergeConfig(base: RelayConfig, draft: RelayConfig, current: Rela
 		}
 		if (record(before) && record(wanted) && record(latest)) {
 			// Never combine one session's endpoint with another session's credential.
-			const routingFields = ["baseUrl", "apiKey", "apiKeyEnv", "allowInsecureHttp", "defaultApi"];
+			const routingFields = ["baseUrl", "apiKey", "apiKeyEnv", "allowInsecureHttp", "defaultApi", "shield"];
 			if (path.length === 3 && path[1] === "providers") {
 				const routing = (entry: Record<string, unknown>) => Object.fromEntries(routingFields.map(key => [key, entry[key]]));
 				if (!same(routing(before), routing(wanted)) && !same(routing(before), routing(latest)) && !same(routing(wanted), routing(latest))) {

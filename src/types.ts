@@ -36,6 +36,7 @@ export interface RelayModelMeta {
 	health?: HealthStatus;
 	metrics?: PerformanceMetrics;
 	lastDiscovered?: number;
+	shield?: boolean;
 }
 
 export interface RelayProviderEntry {
@@ -55,6 +56,21 @@ export interface RelayProviderEntry {
 	modelApiOverrides?: Record<string, RelayApi>;
 	models: Record<string, RelayModelMeta>;
 	enabledModels: string[];
+	shield?: ShieldSettings;
+}
+
+export interface CustomShieldRule {
+	label: string;
+	pattern: string;
+	flags?: string;
+}
+
+export interface ShieldSettings {
+	enabled: boolean;
+	rules?: Record<string, boolean>;
+	customWords?: string[] | Record<string, string>;
+	customRules?: CustomShieldRule[];
+	maskToolArguments?: boolean;
 }
 
 export interface RelaySettings {

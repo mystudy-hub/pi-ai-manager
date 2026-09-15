@@ -27,8 +27,12 @@ async function runTests() {
 		parseContextWindow = utilsMod.parseContextWindow;
 	} catch {
 		let piRequire;
+		const appData = process.env.APPDATA;
+		const defaultPkgDir = appData
+			? join(appData, "npm", "node_modules", "@earendil-works", "pi-coding-agent")
+			: "C:/Users/maoju/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent";
 		try {
-			piRequire = createRequire(join(process.env.PI_CODING_AGENT_PACKAGE_DIR || "C:/Users/maoju/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent", "package.json"));
+			piRequire = createRequire(join(process.env.PI_CODING_AGENT_PACKAGE_DIR || defaultPkgDir, "package.json"));
 		} catch {
 			piRequire = require;
 		}
