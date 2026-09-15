@@ -28,6 +28,7 @@ import { TextInput } from "./tui-input.ts";
 import { OperationHistory, type Operation } from "./tui-state.ts";
 import { beside, cell, fitHints, focusOffset, screen, screenSize, wrapLines, type ViewTheme, type ScreenSize } from "./tui-layout.ts";
 import { effectiveHealth, modelDetails, modelHeader, modelLine, modelSettingsLines, recordTime, type ModelRow } from "./tui-models.ts";
+import { syncMaskitRules } from "./shield/sync.ts";
 import { summarizeDraft, type DraftSummary } from "./tui-draft.ts";
 import { COMMANDS, MODEL_SETTING_COMMANDS, HELP_TEXT, FILTER_LABELS, QUALITY_LABELS, SORT_LABELS, browseFooter, commandForInput, commandHint, dialogFooter, type Command, type CommandId, type MenuItem } from "./tui-commands.ts";
 
@@ -193,9 +194,9 @@ export class RelayManagerTUI {
 		this.temporaryProviders.clear();
 	}
 
-	private registerTemporary(name: string, entry: RelayProviderEntry, ids?: string[]): void {
+	private async registerTemporary(name: string, entry: RelayProviderEntry, ids?: string[]): Promise<void> {
 		this.temporaryProviders.add(name);
-		registerProviderFor(this.pi, name, entry, ids);
+		await registerProviderFor(this.pi, name, entry, ids);
 	}
 
 	private abortActiveTasks(): void {
@@ -614,6 +615,7 @@ export class RelayManagerTUI {
 			"网关：" + safeDisplay(gateway),
 			"连接地址：" + safeDisplay(entry.baseUrl),
 			"默认协议：" + entry.defaultApi,
+			"脱敏保护 (Data Maskit Shield)：" + (entry.shield?.enabled ? "🟢 已开启 (19类规则+流式还原)" : "⚪ 未开启 (在网关栏按 S 切换)"),
 			"凭据：" + (hasProviderAuth(this.ctx, gateway, entry) ? "已配置" : "未配置") + "；来源：" + source,
 			"凭据已配置只表示存在凭据，不代表已验证连通性。",
 			"模型：已启用 " + entry.enabledModels.length + " / 共 " + Object.keys(entry.models).length,
@@ -635,7 +637,8 @@ export class RelayManagerTUI {
 		if (!name) return "";
 		const entry = this.config.providers[name];
 		const selected = name === this.state.selectedGateway;
-		const label = (selected ? "> " : "  ") + safeDisplay(name);
+		const shieldTag = entry?.shield?.enabled ? " 🛡️" : "";
+		const label = (selected ? "> " : "  ") + safeDisplay(name) + shieldTag;
 		const countText = entry.enabledModels.length + "/" + Object.keys(entry.models).length;
 		const counts = entry.enabledModels.length > 0 ? theme.fg("success", countText) : theme.fg("dim", countText);
 		const styledLabel = selected && this.state.activePane === "gateways"
@@ -1120,7 +1123,7 @@ export class RelayManagerTUI {
 				const key = await providerApiKey(this.ctx, gateway, this.config.providers[gateway]);
 				if (!this.taskIsCurrent(controller)) return;
 				if (key) this.sessionSecrets.add(key);
-				this.registerTemporary(gateway, this.config.providers[gateway]);
+				await this.registerTemporary(gateway, this.config.providers[gateway]);
 				limiters.set(gateway, new RateLimiter(this.config.settings.testRequestDelayMs ?? DEFAULT_TEST_REQUEST_DELAY_MS));
 			}
 			let next = 0;
@@ -1513,6 +1516,61 @@ export class RelayManagerTUI {
 				break;
 			case "add": this.openAddForm(); break;
 			case "edit": this.openAddForm(true); break;
+			case "shield": {
+				const gateway = this.state.selectedGateway;
+				const entry = this.config.providers[gateway];
+				if (!entry) break;
+
+				if (this.state.activePane === "models") {
+					const row = this.state.filteredRows[this.state.selectedModelIndex];
+					if (!row) break;
+					const meta = entry.models[row.id];
+					if (!meta) break;
+					const current = meta.shield ?? entry.shield?.enabled ?? false;
+					const next = !current;
+					const before = meta.shield;
+					this.recordModelEdit(gateway, row.id, `Toggle Privacy Shield for ${row.id}`, ["shield" as any]);
+					meta.shield = next;
+					this.draftCache = null;
+					this.loadModels();
+					this.ctx.ui.notify(`模型 ${row.id} 脱敏保护已${next ? "开启 🛡️" : "关闭"}`, "info");
+				} else {
+					const before = entry.shield ? JSON.parse(JSON.stringify(entry.shield)) : undefined;
+					const nextEnabled = !(entry.shield?.enabled ?? false);
+					entry.shield = {
+						...(entry.shield ?? {}),
+						enabled: nextEnabled,
+					};
+					this.operationHistory.record({
+						gateway,
+						description: `Toggle Privacy Shield for ${gateway}`,
+						undo: () => {
+							if (before) entry.shield = JSON.parse(JSON.stringify(before));
+							else delete entry.shield;
+							this.draftCache = null;
+							this.loadModels();
+						},
+					});
+					this.draftCache = null;
+					this.ctx.ui.notify(`网关 ${gateway} 全局脱敏保护已${nextEnabled ? "开启 🛡️" : "关闭"}`, "info");
+				}
+				break;
+			}
+			case "sync-shield-upstream": {
+				this.ctx.ui.notify("正在从 Data Maskit 同步最新规则...", "info");
+				await this.runTask(async () => {
+					this.taskLabel = "同步 Maskit 规则";
+					try {
+						const res = await syncMaskitRules();
+						const newCat = res.newCategories.length > 0 ? `（新增类别: ${res.newCategories.join(", ")}）` : "";
+						this.notice = `已从 Maskit 同步 ${res.totalRules} 条规则${newCat}`;
+						this.ctx.ui.notify(`✓ 成功从 Maskit 同步升级！共 ${res.totalRules} 条规则`, "info");
+					} catch (err: any) {
+						this.reportError(err);
+					}
+				});
+				break;
+			}
 			case "delete":
 				this.confirmDelete = this.state.selectedGateway;
 				this.panelOffset = 0;
@@ -1529,7 +1587,7 @@ export class RelayManagerTUI {
 			case "stop": this.stopTask(); break;
 			case "save":
 				this.abortActiveTasks();
-				if (!this.save()) return true;
+				if (!(await this.save())) return true;
 				this.isClosed = true;
 				this.saved = true;
 				return false;

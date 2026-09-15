@@ -70,7 +70,9 @@ export function modelLine(row: ModelRow, entry: RelayProviderEntry, selected: bo
 		: elapsed !== "—" && health === "degraded" ? theme.fg("warning", elapsed) : elapsed;
 	const reasoningText = modelReasoning(entry, row.id) ? theme.fg("accent", "支持") : "不支持";
 	const check = row.enabled ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
-	const name = cell(safeDisplay(row.id), columns.name);
+	const isShielded = row.meta.shield ?? entry.shield?.enabled ?? false;
+	const shieldTag = isShielded ? " 🛡️" : "";
+	const name = cell(safeDisplay(row.id) + shieldTag, columns.name);
 	return cell(`${selected ? theme.fg("accent", ">") : " "} ${check}  ${selected ? theme.bold(name) : name}` +
 		(columns.protocol ? ` ${cell(API_LABELS[applyOverride(row.id, row.meta.api, rules)], columns.protocol)}` : "") +
 		(columns.reasoning ? ` ${cell(reasoningText, columns.reasoning)}` : "") +
@@ -83,12 +85,14 @@ export function modelLine(row: ModelRow, entry: RelayProviderEntry, selected: bo
 export function modelSettingsLines(entry: RelayProviderEntry, row: ModelRow, width: number,
 	rules: CompiledOverride[] = compileOverrides(entry.modelApiOverrides ?? {})): string[] {
 	const limits = modelLimits(entry, row.id);
+	const isShielded = row.meta.shield ?? entry.shield?.enabled ?? false;
 	const protocol = `${commandHint("protocol")}：${API_LABELS[applyOverride(row.id, row.meta.api, rules)]}`;
 	const protocolWithSource = protocol + (rules.some(rule => rule.regex.test(row.id)) ? "（规则）" : "（自动）");
 	const hints = [
 		visibleWidth(protocolWithSource) <= width ? protocolWithSource : protocol,
 		`${commandHint("reasoning")}：${modelReasoning(entry, row.id) ? "支持" : "不支持"}`,
 		`${commandHint("context")}：${limits.estimated ? "约" : ""}${limits.contextWindow.toLocaleString("en-US")}`,
+		`${commandHint("shield")}：${isShielded ? "开启 🛡️" : "关闭"}`,
 	];
 	const lines: string[] = [];
 	for (const hint of hints) {
@@ -108,9 +112,12 @@ export function modelDetails(gateway: string, entry: RelayProviderEntry, row: Mo
 	const model = buildModelConfigs(entry, [row.id])[0];
 	const limits = modelLimits(entry, row.id);
 	const pinned = compileOverrides(entry.modelApiOverrides ?? {}).some(rule => rule.regex.test(row.id));
+	const isShielded = row.meta.shield ?? entry.shield?.enabled ?? false;
+	const shieldSource = row.meta.shield !== undefined ? "单模型设置" : entry.shield?.enabled ? "继承网关" : "默认关闭";
 	const lines = [
 		`模型 ID：${safeDisplay(row.id)}`,
 		`网关：${safeDisplay(gateway)} · ${row.enabled ? "已启用" : "未启用"}`,
+		`脱敏保护 (Data Maskit Shield)：${isShielded ? "🟢 已开启" : "⚪ 未开启"}（${shieldSource}；S 切换）`,
 		`协议：${model?.api ?? row.meta.api}（${pinned ? "手工规则" : "自动 / 发现"}；p 切换）`,
 		`上下文：${limits.contextWindow.toLocaleString("en-US")} tokens${limits.estimated ? "（估算）" : ""}（C 修改）`,
 		`最大输出：${limits.maxTokens.toLocaleString("en-US")} tokens`,

@@ -35,6 +35,8 @@ export const COMMANDS = [
 	{ id: "undo", keys: ["u"], keyHint: "u", label: "撤销最近修改", short: "撤销", group: "保存", needs: "history" },
 	{ id: "add", keys: ["n"], keyHint: "n", label: "新增网关", short: "新增", group: "网关" },
 	{ id: "edit", keys: [Key.shift("e")], keyHint: "E", label: "编辑网关", short: "编辑", group: "网关", needs: "gateway" },
+	{ id: "shield", keys: ["m", "M", Key.shift("s"), Key.shift("S")], keyHint: "m/S", label: "切换脱敏保护 (支持按 m 或 Shift+S)", short: "脱敏", group: "设置", needs: "gateway" },
+	{ id: "sync-shield-upstream", keys: [], keyHint: "", label: "从 Maskit 一键在线同步升级脱敏规则", short: "同步上游规则", group: "网关" },
 	{ id: "delete", keys: [Key.shift("d")], keyHint: "D", label: "删除网关（先确认，也可 dd）", short: "删除", group: "网关", pane: "gateways", needs: "gateway" },
 	{ id: "refresh", keys: ["r"], keyHint: "r", label: "从中转站更新支持的模型 (同步远程最新模型)", short: "更新模型", group: "同步", needs: "gateway" },
 	{ id: "refresh-all", keys: [Key.shift("r")], keyHint: "R", label: "从中转站更新所有网关模型", short: "全部更新", group: "同步", needs: "gateway" },
@@ -55,7 +57,7 @@ export type CommandId = typeof COMMANDS[number]["id"];
 export type Command = CommandDefinition & { id: CommandId };
 
 /** Keep all per-model settings available in both the main view and details. */
-export const MODEL_SETTING_COMMANDS = ["protocol", "reasoning", "context"] as const satisfies readonly CommandId[];
+export const MODEL_SETTING_COMMANDS = ["protocol", "reasoning", "context", "shield"] as const satisfies readonly CommandId[];
 
 export function commandForInput(data: string, pane: "models" | "gateways"): Command | undefined {
 	return (COMMANDS as readonly Command[]).find(command => (!command.pane || command.pane === pane) &&
@@ -69,8 +71,8 @@ export function commandHint(id: CommandId): string {
 
 export function browseFooter(width: number, pane: "models" | "gateways", running: boolean): string[] {
 	const ids: CommandId[] = pane === "models"
-		? ["toggle", "refresh", "details", "filters", "search", "help"]
-		: ["add", "refresh", "edit", "details", "delete", "help"];
+		? ["toggle", "refresh", "details", "shield", "filters", "search", "help"]
+		: ["add", "refresh", "edit", "shield", "details", "delete", "help"];
 	const actions = fitHints([commandHint("actions"), ...(pane === "models" ? MODEL_SETTING_COMMANDS.map(commandHint) : []),
 		"Tab 切栏", ...ids.map(commandHint), "↑↓ 移动"], width);
 	const save = running ? "Enter 停止并保存" : commandHint("save");

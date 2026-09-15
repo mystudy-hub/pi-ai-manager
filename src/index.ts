@@ -18,18 +18,32 @@ import { readConfig } from "./config.ts";
 import { registerProviderFor } from "./provider.ts";
 import { registerCommands } from "./commands.ts";
 import { safeError } from "./security.ts";
+import { getGlobalShieldProxy } from "./shield/proxy.ts";
 
 // ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
-export default function aiGateway(pi: ExtensionAPI): void {
+export default async function aiGateway(pi: ExtensionAPI): Promise<void> {
 	registerCommands(pi);
 	let config;
 	try { config = readConfig(); }
 	catch (error) {
 		console.error(`ai-gateway: ${safeError(error)}`);
 		return;
+	}
+
+	// Start Privacy Shield Proxy before registering any providers
+	const hasShield = Object.values(config.providers).some(
+		(p) => p.shield?.enabled || Object.values(p.models || {}).some((m) => m.shield === true)
+	);
+	if (hasShield) {
+		try {
+			const port = await getGlobalShieldProxy().start();
+			console.log(`ai-gateway v3: Privacy Shield (Data Maskit) proxy active on 127.0.0.1:${port}`);
+		} catch (err) {
+			console.error(`ai-gateway v3: Failed to start Privacy Shield proxy: ${safeError(err)}`);
+		}
 	}
 
 	// One invalid gateway must not stop other gateways or remove the manager command.
@@ -41,6 +55,12 @@ export default function aiGateway(pi: ExtensionAPI): void {
 		} catch (error) {
 			console.error(`ai-gateway: could not register ${name}: ${safeError(error, [entry.apiKey ?? "", entry.apiKeyEnv ? process.env[entry.apiKeyEnv] ?? "" : ""])}`);
 		}
+	}
+
+	if (typeof pi.on === "function") {
+		pi.on("session_shutdown", async () => {
+			await getGlobalShieldProxy().stop();
+		});
 	}
 
 	if (Object.keys(config.providers).length === 0) {
