@@ -35,7 +35,7 @@ export const COMMANDS = [
 	{ id: "undo", keys: ["u"], keyHint: "u", label: "撤销最近修改", short: "撤销", group: "保存", needs: "history" },
 	{ id: "add", keys: ["n"], keyHint: "n", label: "新增网关", short: "新增", group: "网关" },
 	{ id: "edit", keys: [Key.shift("e")], keyHint: "E", label: "编辑网关", short: "编辑", group: "网关", needs: "gateway" },
-	{ id: "shield", keys: ["m", "M", Key.shift("s"), Key.shift("S")], keyHint: "m/S", label: "切换脱敏保护 (支持按 m 或 Shift+S)", short: "脱敏", group: "设置", needs: "gateway" },
+	{ id: "shield", keys: ["m", Key.shift("m"), Key.shift("s")], keyHint: "m/S", label: "切换脱敏保护 (支持按 m 或 Shift+S)", short: "脱敏", group: "设置", needs: "gateway" },
 	{ id: "sync-shield-upstream", keys: [], keyHint: "", label: "从 Maskit 一键在线同步升级脱敏规则", short: "同步上游规则", group: "网关" },
 	{ id: "delete", keys: [Key.shift("d")], keyHint: "D", label: "删除网关（先确认，也可 dd）", short: "删除", group: "网关", pane: "gateways", needs: "gateway" },
 	{ id: "refresh", keys: ["r"], keyHint: "r", label: "从中转站更新支持的模型 (同步远程最新模型)", short: "更新模型", group: "同步", needs: "gateway" },
