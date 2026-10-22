@@ -5,7 +5,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
 import type { RelayProviderEntry } from "./types.ts";
-import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from "./types.ts";
+import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, ENDPOINT_TYPE_TO_APIS, SUPPORTED_APIS } from "./types.ts";
 import { compileOverrides, applyOverride, resolveApiBaseUrl, resolveApi, type DiscoveredModel } from "./network.ts";
 import { inferReasoningSupport, inferThinkingLevelMap, inferModelCompat } from "./reasoning.ts";
 import { canonicalBaseUrl, isSafeIdentifier, literalCredential, isEnvName } from "./security.ts";
@@ -74,13 +74,40 @@ export interface GatewaySyncResult {
 	totalRemote: number;
 	addedModels: string[];
 	updatedModels: string[];
-	missingModels: string[];
+	/** Models deleted from the entry: absent upstream or exposed only over an unusable protocol. */
+	removedModels: string[];
+	/** Remote models skipped because every endpoint type they advertise is unsupported. */
+	unsupportedModels: string[];
+	/** True when a prune was suppressed because the response could not be a usable catalogue. */
+	removalSkipped: boolean;
 	timestamp: number;
 }
 
 /**
+ * A discovered model is unusable when the gateway tags it with endpoint types and
+ * none of them map to a protocol Pi can speak. Untagged models stay: an absent
+ * tag is not evidence against the model, so the gateway default still applies.
+ */
+export function isUnsupportedDiscovery(model: DiscoveredModel): boolean {
+	if (model.types.length === 0) return false;
+	for (const type of model.types) {
+		const apis = Object.hasOwn(ENDPOINT_TYPE_TO_APIS, type) ? ENDPOINT_TYPE_TO_APIS[type] : [];
+		if (apis.some(api => SUPPORTED_APIS.has(api))) return false;
+	}
+	return true;
+}
+
+/**
  * Sync and merge discovery results into a provider entry in place.
- * Returns structured details about added, updated, and missing models.
+ *
+ * Models disappear again as well: anything the gateway no longer lists, and
+ * anything it lists only over an unsupported protocol, is dropped from both
+ * `models` and `enabledModels`. Only entries carrying a discovery stamp are
+ * pruned, so a hand-written model that the gateway never lists is never
+ * silently retired. Pruning is skipped when the response cannot be a usable
+ * catalogue (empty, or without a single supported model), which keeps a
+ * gateway glitch from turning into a wiped model list; callers surface that as
+ * `removalSkipped`.
  */
 export function syncProviderModels(
 	entry: RelayProviderEntry,
@@ -91,9 +118,14 @@ export function syncProviderModels(
 	const remoteIds = new Set<string>();
 	const addedModels: string[] = [];
 	const updatedModels: string[] = [];
+	const unsupportedModels: string[] = [];
 
 	for (const model of list) {
 		if (!isSafeIdentifier(model.id)) continue;
+		if (isUnsupportedDiscovery(model)) {
+			unsupportedModels.push(model.id);
+			continue;
+		}
 		remoteIds.add(model.id);
 		const existing = entry.models[model.id];
 		if (existing) {
@@ -131,14 +163,29 @@ export function syncProviderModels(
 		};
 	}
 
-	const missingModels = Object.keys(entry.models).filter((id) => !remoteIds.has(id));
+	const prunable = Object.keys(entry.models).filter((id) => entry.models[id]?.lastDiscovered !== undefined);
+	// Two responses must never trigger a prune: an empty catalogue (discovery was
+	// probably rejected or truncated) and one whose every model is unsupported
+	// (the gateway most likely changed its metadata, not its whole catalogue).
+	const removalSkipped = list.length === 0 || (remoteIds.size === 0 && prunable.length > 0);
+	const removedModels = removalSkipped
+		? []
+		: prunable.filter((id) => !remoteIds.has(id));
+
+	for (const id of removedModels) delete entry.models[id];
+	if (removedModels.length > 0) {
+		const removed = new Set(removedModels);
+		entry.enabledModels = entry.enabledModels.filter((id) => !removed.has(id));
+	}
 
 	return {
 		gateway: gatewayName,
 		totalRemote: list.length,
 		addedModels,
 		updatedModels,
-		missingModels,
+		removedModels,
+		unsupportedModels,
+		removalSkipped,
 		timestamp: Date.now(),
 	};
 }
@@ -153,9 +200,9 @@ export function syncProviderModels(
 export function applyDiscovery(
 	entry: RelayProviderEntry,
 	list: readonly DiscoveredModel[],
-): { added: number; updated: number } {
+): { added: number; updated: number; removed: number } {
 	const res = syncProviderModels(entry, list);
-	return { added: res.addedModels.length, updated: res.updatedModels.length };
+	return { added: res.addedModels.length, updated: res.updatedModels.length, removed: res.removedModels.length };
 }
 
 export function buildModelConfigs(entry: RelayProviderEntry, ids: readonly string[], baseUrlOverride?: string, gatewayName?: string): ProviderModelConfig[] {

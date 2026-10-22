@@ -43,7 +43,11 @@ interface SyncSummaryState {
 	totalRemote: number;
 	addedModels: string[];
 	updatedModels: string[];
-	missingModels: string[];
+	removedModels: string[];
+	unsupportedModels: string[];
+	removalSkipped: boolean;
+	/** Pre-sync snapshot of the gateway, so `u` undoes additions and deletions together. */
+	restore: { models: Record<string, RelayModelMeta>; enabledModels: string[] };
 	selectedAddedIndex: number;
 	scrollOffset: number;
 }
@@ -578,7 +582,7 @@ export class RelayManagerTUI {
 		} else if (this.state.mode === "sync-summary" && this.syncSummary) {
 			body = this.renderSyncSummary(size, theme);
 			footer = [
-				fitHints(["A 全部启用新模型", "Space 切换勾选", "u 撤销更新", "↑↓ 滚动"], size.width),
+				fitHints(["A 全部启用新模型", "Space 切换勾选", "u 撤销本次同步", "↑↓ 滚动"], size.width),
 				dialogFooter(size.width, "完成", "返回"),
 			];
 		} else {
@@ -734,7 +738,7 @@ export class RelayManagerTUI {
 		const w = size.width;
 
 		lines.push(cell(theme.bold(theme.fg("accent", `📡 中转站模型同步报告 · [${s.gateway}]`)), w));
-		lines.push(cell(`远程模型: ${s.totalRemote} 个  │  🟢 新增: +${s.addedModels.length}  │  ⚪ 现有: ${s.updatedModels.length}  │  🔴 远端未返回: ${s.missingModels.length}`, w));
+		lines.push(cell(`远程模型: ${s.totalRemote} 个  │  🟢 新增: +${s.addedModels.length}  │  ⚪ 现有: ${s.updatedModels.length}  │  🗑️ 自动删除: ${s.removedModels.length}`, w));
 		lines.push(theme.fg("dim", "─".repeat(Math.max(1, w))));
 
 		if (s.addedModels.length > 0) {
@@ -759,14 +763,36 @@ export class RelayManagerTUI {
 			if (s.addedModels.length > maxRows) {
 				lines.push(theme.fg("dim", cell(`  ... 显示 ${start + 1}-${end} / 共 ${s.addedModels.length} 个新模型 (↑↓ 滚动)`, w)));
 			}
+		} else if (s.removedModels.length === 0) {
+			lines.push(theme.fg("success", "🎉 本地模型库与中转站完全一致,未发现新增或失效模型。"));
+			lines.push(theme.fg("dim", "已有模型的最新兼容格式与端点参数已无缝刷新。"));
 		} else {
-			lines.push(theme.fg("success", "🎉 本地模型库与中转站完全一致，未发现新增模型。"));
+			lines.push(theme.fg("warning", `🗑️ 本次同步没有新增模型,仅删除了 ${s.removedModels.length} 个失效模型。`));
 			lines.push(theme.fg("dim", "已有模型的最新兼容格式与端点参数已无缝刷新。"));
 		}
 
-		if (s.missingModels.length > 0 && lines.length < size.bodyRows - 1) {
+		const listLine = (color: "warning" | "dim", prefix: string, ids: readonly string[], limit = 4) => {
+			const shown = ids.slice(0, limit).join(", ") + (ids.length > limit ? "..." : "");
+			lines.push(theme.fg(color, cell(`${prefix}(${ids.length} 个): ${shown}`, w)));
+		};
+
+		if (s.removedModels.length > 0 && lines.length < size.bodyRows - 1) {
 			lines.push("");
-			lines.push(theme.fg("dim", cell(`🔴 远端本次未返回的模型 (${s.missingModels.length} 个): ${s.missingModels.slice(0, 4).join(", ")}${s.missingModels.length > 4 ? "..." : ""}`, w)));
+			lines.push(theme.fg("warning", "🗑️ 已自动删除远端不再返回或协议不再支持的模型 (按 [u] 撤销本次同步):"));
+			listLine("dim", "🟡", s.removedModels);
+		}
+
+		// Unsupported models are skipped rather than added, so the report is the only
+		// place they show up; ones already listed as removed are not repeated.
+		const skippedUnsupported = s.unsupportedModels.filter(id => !s.removedModels.includes(id));
+		if (skippedUnsupported.length > 0 && lines.length < size.bodyRows - 1) {
+			lines.push(theme.fg("dim", "🚫 远端协议不受支持的模型(不导入):"));
+			listLine("dim", "⚫", skippedUnsupported);
+		}
+
+		if (s.removalSkipped && lines.length < size.bodyRows - 1) {
+			lines.push("");
+			lines.push(theme.fg("warning", cell("⚠️ 远端本次没有返回任何可用模型,已暂停自动删除以保护本地模型库。请确认网关状态后重试。", w)));
 		}
 
 		while (lines.length < size.bodyRows) lines.push("");
@@ -892,18 +918,23 @@ export class RelayManagerTUI {
 				totalRemote: syncResult.totalRemote,
 				addedModels: syncResult.addedModels,
 				updatedModels: syncResult.updatedModels,
-				missingModels: syncResult.missingModels,
+				removedModels: syncResult.removedModels,
+				unsupportedModels: syncResult.unsupportedModels,
+				removalSkipped: syncResult.removalSkipped,
+				restore: { models: previousModels, enabledModels: previousEnabled },
 				selectedAddedIndex: 0,
 				scrollOffset: 0,
 			};
-			if (syncResult.addedModels.length > 0) {
+			if (syncResult.addedModels.length > 0 || syncResult.removedModels.length > 0) {
 				this.state.mode = "sync-summary";
 			}
 
-			const addedInfo = syncResult.addedModels.length > 0 ? `，新增 ${syncResult.addedModels.length} 个新模型` : "，已是最新";
-			const noticeMsg = `已从中转站同步 ${gateway} 的 ${list.length} 个模型（现有 ${syncResult.updatedModels.length} 个${addedInfo}）；Enter 保存草稿。`;
+			const addedInfo = syncResult.addedModels.length > 0 ? `,新增 ${syncResult.addedModels.length} 个新模型` : ",已是最新";
+			const removedInfo = syncResult.removedModels.length > 0 ? `,自动删除 ${syncResult.removedModels.length} 个失效模型` : "";
+			const skippedInfo = syncResult.removalSkipped ? ",已暂停自动删除" : "";
+			const noticeMsg = `已从中转站同步 ${gateway} 的 ${list.length} 个模型(现有 ${syncResult.updatedModels.length} 个${addedInfo}${removedInfo}${skippedInfo});Enter 保存草稿。`;
 			this.notice = noticeMsg;
-			this.ctx.ui.notify(`Discovered ${list.length} models for ${gateway}. Enter saves the draft.`, "info");
+			this.ctx.ui.notify(`Discovered ${list.length} models for ${gateway}, removed ${syncResult.removedModels.length}. Enter saves the draft.`, "info");
 		});
 	}
 
@@ -1083,6 +1114,8 @@ export class RelayManagerTUI {
 		await this.runTask(async controller => {
 			let successful = 0;
 			let totalAdded = 0;
+			let totalRemoved = 0;
+			let skipped = 0;
 			const entries = Object.entries(this.config.providers);
 			for (const [name, entry] of entries) {
 				if (!this.taskIsCurrent(controller)) return;
@@ -1096,6 +1129,8 @@ export class RelayManagerTUI {
 					if (!this.taskIsCurrent(controller)) return;
 					const res = syncProviderModels(entry, list, name);
 					totalAdded += res.addedModels.length;
+					totalRemoved += res.removedModels.length;
+					if (res.removalSkipped) skipped++;
 					this.draftCache = null;
 					if (this.state.selectedGateway === name) this.loadModels();
 					successful++;
@@ -1106,7 +1141,7 @@ export class RelayManagerTUI {
 			}
 			if (!this.taskIsCurrent(controller)) return;
 			this.loadModels();
-			this.notice = `已同步 ${successful}/${entries.length} 个中转站（共新增 ${totalAdded} 个模型）；Enter 保存草稿。`;
+			this.notice = `已同步 ${successful}/${entries.length} 个中转站(共新增 ${totalAdded} 个,自动删除 ${totalRemoved} 个模型${skipped > 0 ? `;${skipped} 个网关暂停自动删除` : ""});Enter 保存草稿。`;
 			this.ctx.ui.notify(`Refreshed ${successful}/${entries.length} gateways. Enter saves the draft.`, "info");
 		});
 	}
@@ -1252,7 +1287,7 @@ export class RelayManagerTUI {
 				}
 			}
 			if (!this.taskIsCurrent(controller) || this.form !== f) return;
-			applyDiscovery(entry, discovered);
+			const discovery = applyDiscovery(entry, discovered);
 			const before = this.config.providers[name] ? JSON.parse(JSON.stringify(this.config.providers[name])) as RelayProviderEntry : undefined;
 			this.operationHistory.record({ gateway: name, description: `${before ? "Edit" : "Add"} provider ${name}`, undo: () => {
 				if (before) this.config.providers[name] = JSON.parse(JSON.stringify(before));
@@ -1268,7 +1303,7 @@ export class RelayManagerTUI {
 			this.loadModels();
 			this.form = null;
 			this.state.mode = "browse";
-			this.ctx.ui.notify(`Provider ${name} ${before ? "updated" : "added"} to draft. Select models, then Enter to save.`, "info");
+			this.ctx.ui.notify(`Provider ${name} ${before ? "updated" : "added"} to draft${discovery.removed > 0 ? `, removed ${discovery.removed} stale model(s)` : ""}. Select models, then Enter to save.`, "info");
 		});
 	}
 
@@ -1793,14 +1828,19 @@ export class RelayManagerTUI {
 
 		// u: 撤销本次更新
 		if (matchesKey(data, "u")) {
-			if (entry && s.addedModels.length > 0) {
-				for (const id of s.addedModels) {
-					delete entry.models[id];
+			if (entry) {
+				const added = s.addedModels.length;
+				const removed = s.removedModels.length;
+				if (added > 0 || removed > 0) {
+					// Restoring the whole snapshot also reverts refreshed metadata, which is
+					// what "undo this sync" should mean; metrics and health survive because
+					// the snapshot is a pre-sync copy of the entry.
+					entry.models = s.restore.models;
+					entry.enabledModels = s.restore.enabledModels;
+					this.draftCache = null;
+					this.loadModels();
+					this.notice = `已撤销本次同步(还原 ${added} 个新增、${removed} 个自动删除的模型)。`;
 				}
-				entry.enabledModels = entry.enabledModels.filter(id => !s.addedModels.includes(id));
-				this.draftCache = null;
-				this.loadModels();
-				this.notice = `已撤销本次同步新增的 ${s.addedModels.length} 个模型。`;
 			}
 			this.syncSummary = null;
 			this.state.mode = "browse";

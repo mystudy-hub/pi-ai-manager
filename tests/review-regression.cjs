@@ -402,4 +402,89 @@ check('Sync models summary supports undoing newly added models', async () => {
   assert.equal(m.config.providers.alpha.models['new-model-xyz'], undefined);
 });
 
+check('Sync deletes models the gateway no longer returns but keeps hand-written ones', async () => {
+  h.reset(fixture());
+  // gpt-5.4 comes from the fixture and was never discovered, so the gateway
+  // cannot retire it; the two other models are products of discovery.
+  global.fetch = async () => discovery([
+    { id: 'gpt-5.4', supported_endpoint_types: ['openai'] },
+    { id: 'discovered-keep', supported_endpoint_types: ['openai'] },
+    { id: 'discovered-drop', supported_endpoint_types: ['openai'] },
+  ]);
+  const m = h.manager();
+  await m.tui.handleInput('r');
+  await m.tui.handleInput('A');
+  await m.tui.handleInput('\x1b');
+  assert.ok(m.config.providers.alpha.models['discovered-drop']);
+  assert.ok(m.config.providers.alpha.enabledModels.includes('discovered-drop'));
+
+  global.fetch = async () => discovery([
+    { id: 'gpt-5.4', supported_endpoint_types: ['openai'] },
+    { id: 'discovered-keep', supported_endpoint_types: ['openai'] },
+  ]);
+  await m.tui.handleInput('r');
+  assert.deepEqual(m.tui.syncSummary.removedModels, ['discovered-drop']);
+  assert.deepEqual(m.tui.syncSummary.addedModels, []);
+  // A removal alone still opens the report, and the enabled set follows it.
+  assert.equal(m.tui.state.mode, 'sync-summary');
+  const report = m.tui.render(100, 24, h.theme).join('\n');
+  assert.equal(report.includes('自动删除'), true);
+  assert.match(report, /discovered-drop/);
+  assert.match(report, /仅删除/);
+  assert.equal(m.config.providers.alpha.models['discovered-drop'], undefined);
+  assert.equal(m.config.providers.alpha.enabledModels.includes('discovered-drop'), false);
+  assert.ok(m.config.providers.alpha.models['discovered-keep']);
+  assert.ok(m.config.providers.alpha.models['gpt-5.4']);
+
+  // u restores the deleted model instead of only reverting additions.
+  await m.tui.handleInput('u');
+  assert.ok(m.config.providers.alpha.models['discovered-drop']);
+  assert.ok(m.config.providers.alpha.enabledModels.includes('discovered-drop'));
+});
+
+check('Sync deletes models whose remote protocols are all unsupported', async () => {
+  h.reset(fixture());
+  global.fetch = async () => discovery([{ id: 'tagged-model', supported_endpoint_types: ['openai'] }]);
+  const m = h.manager();
+  await m.tui.handleInput('r');
+  await m.tui.handleInput('\x1b');
+  assert.ok(m.config.providers.alpha.models['tagged-model']);
+
+  global.fetch = async () => discovery([
+    { id: 'tagged-model', supported_endpoint_types: ['gemini'] },
+    { id: 'openai-model', supported_endpoint_types: ['openai'] },
+  ]);
+  await m.tui.handleInput('r');
+  assert.deepEqual(m.tui.syncSummary.removedModels, ['tagged-model']);
+  assert.deepEqual(m.tui.syncSummary.unsupportedModels, ['tagged-model']);
+  assert.equal(m.tui.syncSummary.removalSkipped, false);
+  assert.equal(m.config.providers.alpha.models['tagged-model'], undefined);
+  assert.ok(m.config.providers.alpha.models['openai-model']);
+});
+
+check('An empty or entirely unsupported catalogue never wipes the model list', async () => {
+  h.reset(fixture());
+  global.fetch = async () => discovery([{ id: 'tagged-model', supported_endpoint_types: ['openai'] }]);
+  const m = h.manager();
+  await m.tui.handleInput('r');
+  await m.tui.handleInput('\x1b');
+
+  // An empty response is far more likely a failed enumeration than a gateway
+  // that withdrew its whole catalogue.
+  global.fetch = async () => discovery([]);
+  await m.tui.handleInput('r');
+  assert.equal(m.tui.syncSummary.removalSkipped, true);
+  assert.equal(m.tui.syncSummary.totalRemote, 0);
+  assert.ok(m.config.providers.alpha.models['tagged-model']);
+  assert.ok(m.config.providers.alpha.models['gpt-5.4']);
+
+  global.fetch = async () => discovery([{ id: 'only-gemini', supported_endpoint_types: ['gemini'] }]);
+  await m.tui.handleInput('r');
+  assert.equal(m.tui.syncSummary.removalSkipped, true);
+  assert.deepEqual(m.tui.syncSummary.unsupportedModels, ['only-gemini']);
+  assert.deepEqual(m.tui.syncSummary.removedModels, []);
+  assert.equal(m.config.providers.alpha.models['only-gemini'], undefined);
+  assert.ok(m.config.providers.alpha.models['tagged-model']);
+});
+
 
