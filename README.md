@@ -2,7 +2,7 @@
 
 Pi Coding Agent 的交互式网关与模型管理扩展。通过 `/ai-manager` 添加、编辑网关，发现模型，检查连通性，管理在 Pi 中启用的模型。
 
-当前适配 Pi **0.85.1–0.85.x**，需要 Node.js **22.19.0 或更新版本**。
+当前适配 Pi **0.85.1 及以上、含 1.x**（已在 Pi 1.3.0 上验证），需要 Node.js **22.19.0 或更新版本**。
 
 ## 安装和加载
 
@@ -17,10 +17,10 @@ npm install
 npm run check
 ```
 
-源码需要可解析的 Pi SDK；测试也需要已安装的 Pi。若没有本地或全局 Pi，可在开发目录安装：
+源码需要可解析的 Pi SDK；测试也需要已安装的 Pi。若没有本地或全局 Pi，可在开发目录安装（版本可换成任意受支持的 Pi 版本，如 1.3.0）：
 
 ```bash
-npm install --no-save --package-lock=false @earendil-works/pi-coding-agent@0.85.1
+npm install --no-save --package-lock=false @earendil-works/pi-coding-agent@1.3.0
 ```
 
 也可以用 `PI_CODING_AGENT_PACKAGE_DIR` 指定已安装 Pi 的包目录供测试加载。修改源码后，在 Pi 中执行 `/reload`，再打开 `/ai-manager`；也可以重启 Pi。
